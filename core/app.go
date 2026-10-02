@@ -65,11 +65,15 @@ type App struct {
 		timer  *time.Timer
 	}
 
-	avatarQ    chan string
-	avatarSeen sync.Map
-	media      sync.Map // in-flight downloads
-	olderAsked sync.Map // chat -> time of last on-demand history request
-	synced     atomic.Bool
+	avatarQ         chan string
+	avatarSeen      sync.Map
+	media           sync.Map // in-flight downloads
+	olderAsked      sync.Map // chat -> time of last on-demand history request
+	groupAsked      sync.Map // group -> time of last member-count lookup
+	backfilled      sync.Map // chat -> struct{}: missing previews/waveforms already re-requested
+	backfillPending sync.Map // chats opened before we were connected
+	thumbAsked      sync.Map // chat/id -> thumbnail download attempted this session
+	synced          atomic.Bool
 
 	statMsgs  atomic.Int64 // messages written
 	statConvs atomic.Int64 // history conversations imported

@@ -33,7 +33,7 @@ const (
 	StPlayed    = 4
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // The UI reads this database directly (read-only), so the schema is the API.
 // Keep column names stable; bump schemaVersion for breaking changes.
@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS chats (
 	archived      INTEGER NOT NULL DEFAULT 0,
 	muted_until   INTEGER NOT NULL DEFAULT 0,
 	avatar        TEXT    NOT NULL DEFAULT '',
-	avatar_ts     INTEGER NOT NULL DEFAULT 0
+	avatar_ts     INTEGER NOT NULL DEFAULT 0,
+	participants  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chats_order ON chats(archived, pinned DESC, last_ts DESC);
 
@@ -112,7 +113,41 @@ CREATE TABLE IF NOT EXISTS kv (
 	k TEXT PRIMARY KEY,
 	v TEXT NOT NULL
 ) WITHOUT ROWID;
+
+-- Per-member delivery/read state for my group messages; a group message only
+-- reads as Delivered/Read once every other member has got there.
+CREATE TABLE IF NOT EXISTS receipts (
+	chat        TEXT    NOT NULL,
+	msg_id      TEXT    NOT NULL,
+	participant TEXT    NOT NULL,
+	status      INTEGER NOT NULL,
+	ts          INTEGER NOT NULL,
+	PRIMARY KEY (chat, msg_id, participant)
+) WITHOUT ROWID;
+
+-- Full-text index over message text and file names, kept in step by triggers.
+-- chat/id are stored so results join back without relying on rowid stability.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+	text, file_name, chat UNINDEXED, id UNINDEXED,
+	tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+	INSERT INTO messages_fts (rowid, text, file_name, chat, id)
+		SELECT new.rowid, new.text, new.file_name, new.chat, new.id WHERE new.text != '' OR new.file_name != '';
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF text, file_name, chat ON messages
+	WHEN old.text != new.text OR old.file_name != new.file_name OR old.chat != new.chat BEGIN
+	DELETE FROM messages_fts WHERE rowid = old.rowid;
+	INSERT INTO messages_fts (rowid, text, file_name, chat, id)
+		SELECT new.rowid, new.text, new.file_name, new.chat, new.id WHERE new.text != '' OR new.file_name != '';
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+	DELETE FROM messages_fts WHERE rowid = old.rowid;
+END;
 `
+
+// Every table the app owns, for drops and wipes.
+var appTables = []string{"chats", "messages", "reactions", "contacts", "avatars", "kv", "receipts", "messages_fts"}
 
 func openAppDB(path string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_txlock=immediate&_foreign_keys=off", path)
@@ -128,6 +163,7 @@ func openAppDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	// Additive migrations keep synced history (WhatsApp won't resend it).
+	fillFTS := false
 	if v == 1 {
 		for _, q := range []string{
 			`ALTER TABLE messages ADD COLUMN waveform BLOB`,
@@ -139,11 +175,19 @@ func openAppDB(path string) (*sql.DB, error) {
 				return nil, err
 			}
 		}
+		v = 2
+	}
+	if v == 2 {
+		if _, err := db.Exec(`ALTER TABLE chats ADD COLUMN participants INTEGER NOT NULL DEFAULT 0`); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return nil, err
+		}
+		fillFTS = true
 		v = schemaVersion
 	}
 	if v != 0 && v != schemaVersion {
 		// Unknown future/past layout: cache only, drop and resync.
-		for _, t := range []string{"chats", "messages", "reactions", "contacts", "avatars", "kv"} {
+		for _, t := range appTables {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return nil, err
 			}
@@ -151,6 +195,13 @@ func openAppDB(path string) (*sql.DB, error) {
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
+	}
+	if fillFTS {
+		// Index history that predates the triggers.
+		if _, err := db.Exec(`INSERT INTO messages_fts (rowid, text, file_name, chat, id)
+			SELECT rowid, text, file_name, chat, id FROM messages WHERE text != '' OR file_name != ''`); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return nil, err
@@ -173,7 +224,7 @@ func openReadDB(path string) (*sql.DB, error) {
 }
 
 func (a *App) wipeAppDB() {
-	for _, t := range []string{"chats", "messages", "reactions", "contacts", "avatars", "kv"} {
+	for _, t := range appTables {
 		a.db.Exec("DELETE FROM " + t)
 	}
 	a.touchAll()

@@ -208,7 +208,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        glassCircle(plusGlass, plusButton, "plus", "Attach photo", #selector(attach))
+        glassCircle(plusGlass, plusButton, "plus", "Attach a photo, video or file", #selector(attach))
         glassCircle(emojiGlass, emojiButton, "face.smiling", "Emoji", #selector(emoji))
 
         field.translatesAutoresizingMaskIntoConstraints = false

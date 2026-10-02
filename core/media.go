@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -11,8 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 )
 
 var mediaTypes = map[string]whatsmeow.MediaType{
@@ -201,4 +208,131 @@ func (a *App) setAvatar(jid, path string) {
 	a.db.Exec(`INSERT INTO avatars (jid, path, ts) VALUES (?,?,?) ON CONFLICT(jid) DO UPDATE SET path=excluded.path, ts=excluded.ts`, jid, path, now)
 	a.db.Exec(`UPDATE chats SET avatar=?, avatar_ts=? WHERE jid=?`, path, now, jid)
 	a.touchChats()
+}
+
+// fetchThumb downloads the small separate thumbnail of an image or video that
+// arrived without an inline JPEGThumbnail. The UI asks for visible rows.
+func (a *App) fetchThumb(chat, id string) {
+	key := chat + "/" + id
+	if _, seen := a.thumbAsked.LoadOrStore(key, true); seen || a.ready() != nil {
+		if a.ready() != nil {
+			a.thumbAsked.Delete(key)
+		}
+		return
+	}
+	var media string
+	var has int
+	if a.rdb.QueryRow(`SELECT media, thumb IS NOT NULL FROM messages WHERE chat=? AND id=?`, chat, id).Scan(&media, &has) != nil ||
+		has == 1 || media == "" {
+		return
+	}
+	var ref mediaRef
+	if json.Unmarshal([]byte(media), &ref) != nil || ref.ThumbPath == "" {
+		a.thumbAsked.Delete(key) // a later backfill may bring the thumbnail path
+		return
+	}
+	mk, _ := base64.StdEncoding.DecodeString(ref.MediaKey)
+	sha, _ := base64.StdEncoding.DecodeString(ref.ThumbSHA)
+	esha, _ := base64.StdEncoding.DecodeString(ref.ThumbEncSHA)
+	var msg whatsmeow.DownloadableThumbnail
+	switch ref.Type {
+	case "image":
+		msg = &waE2E.ImageMessage{ThumbnailDirectPath: proto.String(ref.ThumbPath), ThumbnailSHA256: sha, ThumbnailEncSHA256: esha, MediaKey: mk}
+	case "video":
+		msg = &waE2E.VideoMessage{ThumbnailDirectPath: proto.String(ref.ThumbPath), ThumbnailSHA256: sha, ThumbnailEncSHA256: esha, MediaKey: mk}
+	default:
+		return
+	}
+	data, err := a.cli.DownloadThumbnail(a.ctx, msg)
+	if err != nil || len(data) == 0 {
+		a.log.Warnf("thumbnail %s: %v", key, err)
+		return
+	}
+	a.db.Exec(`UPDATE messages SET thumb=? WHERE chat=? AND id=? AND thumb IS NULL`, data, chat, id)
+	a.touchMsg(chat, id)
+}
+
+// videoPrefix downloads and decrypts only the first `want` bytes of a video:
+// AES-CBC decrypts any block-aligned prefix, and a faststart mp4 keeps its
+// index and first keyframe up front. The UI pulls frame 1 out of it for the
+// thumbnail and deletes the file; the whole video only downloads when played.
+func (a *App) videoPrefix(chat, id string, want int) (any, error) {
+	if err := a.ready(); err != nil {
+		return nil, err
+	}
+	if want <= 0 || want > 4<<20 {
+		want = 512 << 10
+	}
+	var media string
+	if err := a.rdb.QueryRow(`SELECT media FROM messages WHERE chat=? AND id=? AND kind=?`, chat, id, KVideo).Scan(&media); err != nil || media == "" {
+		return nil, errors.New("no video")
+	}
+	var ref mediaRef
+	if json.Unmarshal([]byte(media), &ref) != nil || ref.DirectPath == "" {
+		return nil, errors.New("bad media ref")
+	}
+	mk, _ := base64.StdEncoding.DecodeString(ref.MediaKey)
+	eh, _ := base64.StdEncoding.DecodeString(ref.FileEncSHA)
+	keys := hkdfutil.SHA256(mk, nil, []byte(whatsmeow.MediaVideo), 112)
+	iv, cipherKey := keys[:16], keys[16:48]
+	conn, err := a.cli.DangerousInternals().RefreshMediaConn(a.ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, host := range conn.Hosts {
+		url := fmt.Sprintf("https://%s%s&hash=%s&mms-type=video&__wa-mms=", host.Hostname, ref.DirectPath, base64.URLEncoding.EncodeToString(eh))
+		req, err := http.NewRequestWithContext(a.ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Origin", "https://web.whatsapp.com")
+		req.Header.Set("Referer", "https://web.whatsapp.com/")
+		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", want-1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, int64(want)))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("expired (%d)", resp.StatusCode)
+		}
+		if (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) || err != nil {
+			lastErr = fmt.Errorf("status %d: %v", resp.StatusCode, err)
+			continue
+		}
+		whole := resp.StatusCode == http.StatusOK || int64(len(data)) < int64(want)
+		if whole && len(data) > 10 {
+			data = data[:len(data)-10] // the whole file came back: drop the trailing MAC
+		}
+		data = data[:len(data)/aes.BlockSize*aes.BlockSize]
+		if len(data) == 0 {
+			return nil, errors.New("empty")
+		}
+		block, err := aes.NewCipher(cipherKey)
+		if err != nil {
+			return nil, err
+		}
+		plain := make([]byte, len(data))
+		cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, data)
+		path := filepath.Join(a.dir, "media", safeName(id)+".prefix.mp4")
+		if err := os.WriteFile(path, plain, 0o600); err != nil {
+			return nil, err
+		}
+		return map[string]any{"path": path}, nil
+	}
+	return nil, fmt.Errorf("video prefix %s: %v", id, lastErr)
+}
+
+// setThumb stores a thumbnail the app made (a video's first frame).
+func (a *App) setThumb(chat, id, b64 string) error {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(data) == 0 {
+		return errors.New("bad thumbnail")
+	}
+	a.db.Exec(`UPDATE messages SET thumb=? WHERE chat=? AND id=? AND thumb IS NULL`, data, chat, id)
+	a.touchMsg(chat, id)
+	return nil
 }

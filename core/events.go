@@ -31,6 +31,8 @@ func (a *App) handle(evt any) {
 		a.onHistory(e)
 	case *events.Receipt:
 		a.onReceipt(e)
+	case groupSize:
+		a.setGroupSize(e.chat, e.n)
 	case *events.ChatPresence:
 		chat := a.canon(e.Chat)
 		emit(map[string]any{"t": "typing", "chat": chat.String(), "sender": a.canon(e.Sender).String(),
@@ -94,6 +96,11 @@ func (a *App) handle(evt any) {
 				e.JID.String(), e.Name.Name)
 			a.touchChats()
 		}
+		if len(e.Join) > 0 || len(e.Leave) > 0 {
+			// Membership changed: refresh the count that group "Read" depends on.
+			a.groupAsked.Delete(e.JID.String())
+			a.fetchGroupSize(e.JID.String())
+		}
 	case *events.JoinedGroup:
 		a.db.Exec(`INSERT INTO chats (jid, name, is_group, last_ts) VALUES (?,?,1,?) ON CONFLICT(jid) DO UPDATE SET name=excluded.name`,
 			e.JID.String(), e.GroupName.Name, time.Now().UnixMilli())
@@ -135,6 +142,11 @@ func (a *App) setChatField(j types.JID, col string, v any) {
 }
 
 func (a *App) afterConnect() {
+	a.backfillPending.Range(func(k, _ any) bool {
+		a.backfillPending.Delete(k)
+		go a.backfill(k.(string))
+		return true
+	})
 	if a.synced.Swap(true) {
 		return
 	}
@@ -143,8 +155,10 @@ func (a *App) afterConnect() {
 		tx, err := a.db.Begin()
 		if err == nil {
 			for _, g := range groups {
-				tx.Exec(`INSERT INTO chats (jid, name, is_group) VALUES (?,?,1) ON CONFLICT(jid) DO UPDATE SET name=excluded.name, is_group=1`,
-					g.JID.String(), g.Name)
+				// Member counts drive group "Read" (read by everyone else).
+				tx.Exec(`INSERT INTO chats (jid, name, is_group, participants) VALUES (?,?,1,?)
+					ON CONFLICT(jid) DO UPDATE SET name=excluded.name, is_group=1, participants=excluded.participants`,
+					g.JID.String(), g.Name, len(g.Participants))
 			}
 			tx.Commit()
 		}
@@ -228,6 +242,9 @@ func (a *App) onMessage(e *events.Message, live bool) {
 	a.statMsgs.Add(1)
 	bumpChat(a.db, r.Chat, chat.Server == types.GroupServer, r.TS, r.ID)
 	a.touchMsg(r.Chat, r.ID)
+	if needsThumb(r) {
+		go a.fetchThumb(r.Chat, r.ID)
+	}
 	if !live {
 		return
 	}
@@ -305,11 +322,114 @@ func (a *App) onReceipt(e *events.Receipt) {
 	default:
 		return
 	}
-	if !e.IsFromMe {
-		for _, id := range e.MessageIDs {
-			a.db.Exec(`UPDATE messages SET status=? WHERE chat=? AND id=? AND from_me=1 AND status < ? AND status >= 0`, st, chat, id, st)
+	if e.IsFromMe {
+		return
+	}
+	if e.IsGroup {
+		a.onGroupReceipt(chat, a.canon(e.Sender).String(), e.MessageIDs, st, e.Timestamp.UnixMilli())
+		return
+	}
+	for _, id := range e.MessageIDs {
+		a.db.Exec(`UPDATE messages SET status=? WHERE chat=? AND id=? AND from_me=1 AND status < ? AND status >= 0`, st, chat, id, st)
+		a.touchMsg(chat, id)
+	}
+}
+
+// onGroupReceipt records one member's receipt; the message's own status only
+// advances once every other member has reached it, as WhatsApp shows it.
+func (a *App) onGroupReceipt(chat, member string, ids []types.MessageID, st int, ts int64) {
+	others := a.groupOthers(chat)
+	for _, id := range ids {
+		a.db.Exec(`INSERT INTO receipts (chat, msg_id, participant, status, ts) VALUES (?,?,?,?,?)
+			ON CONFLICT(chat, msg_id, participant) DO UPDATE SET status=MAX(receipts.status, excluded.status), ts=excluded.ts`,
+			chat, id, member, st, ts)
+		a.applyGroupStatus(chat, id, others)
+	}
+}
+
+// applyGroupStatus derives a group message's status from its receipts. With an
+// unknown member count it claims no more than Delivered.
+func (a *App) applyGroupStatus(chat, id string, others int) {
+	var delivered, read, played int
+	a.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(status >= ?), 0), COALESCE(SUM(status >= ?), 0)
+		FROM receipts WHERE chat=? AND msg_id=?`, StRead, StPlayed, chat, id).Scan(&delivered, &read, &played)
+	st := StSent
+	switch {
+	case others <= 0:
+		if delivered > 0 {
+			st = StDelivered
+		}
+	case played >= others:
+		st = StPlayed
+	case read >= others:
+		st = StRead
+	case delivered >= others:
+		st = StDelivered
+	}
+	if res, err := a.db.Exec(`UPDATE messages SET status=? WHERE chat=? AND id=? AND from_me=1 AND status >= 0 AND status < ?`,
+		st, chat, id, st); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
 			a.touchMsg(chat, id)
 		}
+	}
+}
+
+// groupOthers is the number of members besides me, or 0 while unknown (a
+// lookup is started; statuses are recomputed when it lands).
+func (a *App) groupOthers(chat string) int {
+	var n int
+	a.db.QueryRow(`SELECT participants FROM chats WHERE jid=?`, chat).Scan(&n)
+	if n > 0 {
+		return n - 1
+	}
+	a.fetchGroupSize(chat)
+	return 0
+}
+
+func (a *App) fetchGroupSize(chat string) {
+	if t, ok := a.groupAsked.Load(chat); ok && time.Since(t.(time.Time)) < 10*time.Minute {
+		return
+	}
+	a.groupAsked.Store(chat, time.Now())
+	go func() {
+		j, err := types.ParseJID(chat)
+		if err != nil || a.ready() != nil {
+			return
+		}
+		g, err := a.cli.GetGroupInfo(a.ctx, j)
+		if err != nil {
+			a.log.Warnf("group size %s: %v", chat, err)
+			return
+		}
+		a.events <- groupSize{chat, len(g.Participants)}
+	}()
+}
+
+// groupSize is queued onto the event loop so writes stay on one goroutine.
+type groupSize struct {
+	chat string
+	n    int
+}
+
+func (a *App) setGroupSize(chat string, n int) {
+	if n <= 0 {
+		return
+	}
+	a.db.Exec(`UPDATE chats SET participants=? WHERE jid=?`, n, chat)
+	rows, err := a.db.Query(`SELECT DISTINCT msg_id FROM receipts WHERE chat=?`, chat)
+	if err != nil {
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		a.applyGroupStatus(chat, id, n-1)
 	}
 }
 
@@ -387,6 +507,9 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 	// History is a snapshot; live app-state events are authoritative, so only
 	// seed metadata for chats we haven't seen, and never move counts backwards
 	// on later chunks of the same chat.
+	if isGroup && len(conv.GetParticipant()) > 0 {
+		tx.Exec(`UPDATE chats SET participants=? WHERE jid=?`, len(conv.GetParticipant()), chat.String())
+	}
 	tx.Exec(`INSERT INTO chats (jid, name, is_group, last_ts, unread, marked_unread, pinned, archived, muted_until)
 		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(jid) DO UPDATE SET
@@ -396,6 +519,7 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		pinned, b2i(conv.GetArchived()), muted)
 
 	msgs := conv.GetMessages() // newest first
+	var thumbs []string        // re-sent photos/videos whose thumbnail is a separate download
 	for i := len(msgs) - 1; i >= 0; i-- {
 		wm := msgs[i].GetMessage()
 		if wm == nil || wm.GetMessage() == nil {
@@ -438,6 +562,9 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		if err := upsertMessage(tx, r); err != nil {
 			continue
 		}
+		if typ == waHistorySync.HistorySync_ON_DEMAND && needsThumb(r) {
+			thumbs = append(thumbs, r.ID)
+		}
 		a.statMsgs.Add(1)
 		for _, rc := range wm.GetReactions() {
 			sj, err := types.ParseJID(rc.GetKey().GetParticipant())
@@ -458,6 +585,13 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		return
 	}
 	a.statConvs.Add(1)
+	if len(thumbs) > 0 {
+		go func() {
+			for _, id := range thumbs {
+				a.fetchThumb(chat.String(), id)
+			}
+		}()
+	}
 	if typ == waHistorySync.HistorySync_ON_DEMAND || len(msgs) > 0 {
 		a.touchReload(chat.String())
 	} else {
@@ -515,11 +649,11 @@ func (a *App) mergeChat(from, to string) error {
 	tx.Exec(`DELETE FROM messages WHERE chat=?`, from)
 	tx.Exec(`UPDATE OR IGNORE reactions SET chat=? WHERE chat=?`, to, from)
 	var c struct {
-		name                          string
-		lastTS                        int64
-		lastID                        string
-		unread, marked, pinned, arch  int64
-		muted                         int64
+		name                         string
+		lastTS                       int64
+		lastID                       string
+		unread, marked, pinned, arch int64
+		muted                        int64
 	}
 	err = tx.QueryRow(`SELECT name, last_ts, last_id, unread, marked_unread, pinned, archived, muted_until FROM chats WHERE jid=?`, from).
 		Scan(&c.name, &c.lastTS, &c.lastID, &c.unread, &c.marked, &c.pinned, &c.arch, &c.muted)
@@ -627,4 +761,10 @@ func (a *App) notify(r *msgRow, chat types.JID) {
 		}
 	}
 	emit(map[string]any{"t": "notify", "chat": r.Chat, "id": r.ID, "title": title, "body": body, "muted": isMuted})
+}
+
+// needsThumb: a photo or video that came without an inline thumbnail but with
+// a separately downloadable one.
+func needsThumb(r *msgRow) bool {
+	return (r.Kind == KImage || r.Kind == KVideo) && len(r.Thumb) == 0 && strings.Contains(r.Media, `"thumb_path"`)
 }

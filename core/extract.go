@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"go.mau.fi/whatsmeow"
 	"strings"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -19,6 +20,10 @@ type mediaRef struct {
 	FileEncSHA string `json:"e"`
 	Type       string `json:"t"` // image | video | audio | document
 	Length     uint64 `json:"l"`
+	// Thumbnail as a separate small download (WhatsApp no longer always inlines JPEGThumbnail).
+	ThumbPath   string `json:"thumb_path,omitempty"`
+	ThumbSHA    string `json:"ts,omitempty"`
+	ThumbEncSHA string `json:"tes,omitempty"`
 }
 
 type downloadable interface {
@@ -33,14 +38,20 @@ func refFor(d downloadable, typ string) string {
 	if d.GetDirectPath() == "" || len(d.GetMediaKey()) == 0 {
 		return ""
 	}
-	b, _ := json.Marshal(mediaRef{
+	ref := mediaRef{
 		DirectPath: d.GetDirectPath(),
 		MediaKey:   base64.StdEncoding.EncodeToString(d.GetMediaKey()),
 		FileSHA:    base64.StdEncoding.EncodeToString(d.GetFileSHA256()),
 		FileEncSHA: base64.StdEncoding.EncodeToString(d.GetFileEncSHA256()),
 		Type:       typ,
 		Length:     d.GetFileLength(),
-	})
+	}
+	if t, ok := d.(whatsmeow.DownloadableThumbnail); ok && t.GetThumbnailDirectPath() != "" {
+		ref.ThumbPath = t.GetThumbnailDirectPath()
+		ref.ThumbSHA = base64.StdEncoding.EncodeToString(t.GetThumbnailSHA256())
+		ref.ThumbEncSHA = base64.StdEncoding.EncodeToString(t.GetThumbnailEncSHA256())
+	}
+	b, _ := json.Marshal(ref)
 	return string(b)
 }
 

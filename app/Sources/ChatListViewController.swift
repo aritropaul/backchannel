@@ -2,6 +2,8 @@ import AppKit
 
 protocol ChatListDelegate: AnyObject {
     func chatList(didSelect chat: Chat?)
+    /// A message search result was picked: open its chat scrolled to it.
+    func chatList(didSelectMessage id: String, in chat: Chat)
 }
 
 /// Source-list row whose selection is the same green as my bubbles (`Theme.selection`), drawn
@@ -33,6 +35,8 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         case archived(count: Int, unread: Int)
         case back
         case chat(Chat)
+        case header(String)
+        case hit(Store.SearchHit)
 
         var key: String {
             switch self {
@@ -40,6 +44,8 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             case .archived: "~archived"
             case .back: "~back"
             case .chat(let c): c.jid
+            case .header(let t): "~h:" + t
+            case .hit(let h): "~m:\(h.chat)/\(h.id)"
             }
         }
     }
@@ -53,6 +59,8 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     private var filter = 0
     private var query = ""
     private(set) var selectedJID: String?
+    /// The picked message search result, so reloads keep it selected.
+    private var selectedHit: String?
     private var typing: [String: Date] = [:]
     private var suppressSelection = false
     private var lastReload = Date.distantPast
@@ -186,7 +194,14 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             let a = store.archivedSummary()
             if a.count > 0 { out.append(.archived(count: a.count, unread: a.unread)) }
         }
-        out += list.map { .chat($0) }
+        if query.isEmpty {
+            out += list.map { .chat($0) }
+        } else {
+            // Search: matching conversations, then matching messages across every chat.
+            if !list.isEmpty { out.append(.header("Conversations")); out += list.map { .chat($0) } }
+            let hits = store.searchMessages(query)
+            if !hits.isEmpty { out.append(.header("Messages")); out += hits.map { .hit($0) } }
+        }
         applyItems(out, animated: animated)
     }
 
@@ -244,6 +259,8 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
                 heights.insert(i)
             case (.archived(let n, let u), let cell as ListLinkCellView):
                 fillArchived(cell, n, u)
+            case (.hit(let h), let cell as ChatCellView):
+                if let c = chat(h.chat) ?? store.chat(h.chat) { cell.configure(hit: h, in: c) }
             default: break
             }
         }
@@ -251,7 +268,9 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     }
 
     private func restoreSelection() {
-        if let jid = selectedJID, let i = index(of: jid) {
+        if let key = selectedHit, let i = items.firstIndex(where: { $0.key == key }) {
+            tableView.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
+        } else if let jid = selectedJID, let i = index(of: jid) {
             tableView.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
         } else {
             tableView.deselectAll(nil)
@@ -277,6 +296,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     func select(jid: String?) {
         selectedJID = jid
+        selectedHit = nil
         if let jid, !orderedJIDs.contains(jid) {
             // Archived or filtered out: switch to a view that contains it.
             if let c = store.chat(jid), c.archived != showingArchived { showingArchived = c.archived }
@@ -308,6 +328,15 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     func focusSearch() { view.window?.makeFirstResponder(search) }
     func focusList() { view.window?.makeFirstResponder(tableView) }
+    func setSearch(_ q: String) {
+        search.stringValue = q
+        searchChanged()
+    }
+    /// Dev hook: picks the first message result, as a click would.
+    func pickFirstHit() {
+        guard let i = items.firstIndex(where: { if case .hit = $0 { return true }; return false }) else { return }
+        tableView.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
+    }
 
     func setTyping(chat: String, on: Bool) {
         typing[chat] = on ? Date().addingTimeInterval(25) : nil
@@ -334,6 +363,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     @objc private func searchChanged() {
         query = search.stringValue.trimmingCharacters(in: .whitespaces)
+        if query.isEmpty { selectedHit = nil }
         rebuildItems(animated: false)
     }
 
@@ -375,15 +405,19 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         switch items[row] {
-        case .chat: 80
+        case .chat, .hit: 80
         case .pinned(let cs): PinnedGridView.height(for: cs.count)
+        case .header: 30
         default: 44
         }
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let r = SidebarRowView()
-        if case .chat = items[row] { r.showsSeparator = true }
+        switch items[row] {
+        case .chat, .hit: r.showsSeparator = true
+        default: break
+        }
         return r
     }
 
@@ -408,6 +442,18 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             v.label.stringValue = "Archived"
             v.count.stringValue = ""
             return v
+        case .header(let title):
+            let id = NSUserInterfaceItemIdentifier("header")
+            let v = tableView.makeView(withIdentifier: id, owner: nil) as? SectionHeaderView ?? SectionHeaderView()
+            v.identifier = id
+            v.label.stringValue = title
+            return v
+        case .hit(let h):
+            let id = NSUserInterfaceItemIdentifier("chat")
+            let v = tableView.makeView(withIdentifier: id, owner: nil) as? ChatCellView ?? ChatCellView()
+            v.identifier = id
+            if let c = chat(h.chat) ?? store.chat(h.chat) { v.configure(hit: h, in: c) }
+            return v
         }
     }
 
@@ -425,17 +471,31 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        if case .chat = items[row] { return true }
-        return false
+        switch items[row] {
+        case .chat, .hit: return true
+        default: return false
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !suppressSelection else { return }
         let row = tableView.selectedRow
-        guard row >= 0, row < items.count, case .chat(let c) = items[row], c.jid != selectedJID else { return }
-        selectedJID = c.jid
-        pinnedGrid.setSelected(c.jid)
-        delegate?.chatList(didSelect: c)
+        guard row >= 0, row < items.count else { return }
+        switch items[row] {
+        case .chat(let c) where c.jid != selectedJID || selectedHit != nil:
+            selectedJID = c.jid
+            selectedHit = nil
+            pinnedGrid.setSelected(c.jid)
+            delegate?.chatList(didSelect: c)
+        case .hit(let h):
+            guard let c = chat(h.chat) ?? store.chat(h.chat) else { return }
+            selectedJID = c.jid
+            selectedHit = items[row].key
+            pinnedGrid.setSelected(c.jid)
+            delegate?.chatList(didSelectMessage: h.id, in: c)
+        default:
+            break
+        }
     }
 
     // MARK: context menu

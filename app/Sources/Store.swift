@@ -199,6 +199,46 @@ final class Store {
                     mutedUntil: r.int(8), avatar: r.str(9), last: last)
     }
 
+    // MARK: search
+
+    struct SearchHit: Equatable {
+        let chat: String
+        let id: String
+        let ts: Int64
+        let fromMe: Bool
+        let senderName: String
+        /// Matched text with the hits wrapped in \u{2}…\u{3}.
+        let snippet: String
+        var date: Date { Date(timeIntervalSince1970: TimeInterval(ts) / 1000) }
+    }
+
+    /// Full-text search over every chat's messages (text and file names), newest first.
+    /// Each word matches as a prefix; all words must match.
+    func searchMessages(_ q: String, limit: Int = 60) -> [SearchHit] {
+        let words = q.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+        guard !words.isEmpty else { return [] }
+        let match = words.map { "\"\($0)\"*" }.joined(separator: " ")
+        var out: [SearchHit] = []
+        query("""
+            SELECT m.chat, m.id, m.ts, m.from_me, m.sender, snippet(messages_fts, -1, char(2), char(3), '…', 14),
+                   sc.name, sc.push_name, m.push_name
+            FROM messages_fts f
+            JOIN messages m ON m.chat = f.chat AND m.id = f.id
+            LEFT JOIN contacts sc ON sc.jid = m.sender
+            WHERE messages_fts MATCH ? AND m.kind != 10
+            ORDER BY m.ts DESC LIMIT ?
+            """, [match, limit]) { r in
+            let fromMe = r.int(3) == 1
+            var sender = r.str(6)
+            if sender.isEmpty { sender = r.str(7) }
+            if sender.isEmpty { sender = r.str(8) }
+            if sender.isEmpty { sender = JID.phone(r.str(4)) }
+            out.append(SearchHit(chat: r.str(0), id: r.str(1), ts: r.int(2), fromMe: fromMe,
+                                 senderName: fromMe ? "You" : sender, snippet: r.str(5)))
+        }
+        return out
+    }
+
     // MARK: messages
 
     private static let msgSQL = """
@@ -238,6 +278,13 @@ final class Store {
         var m: Message?
         query(Store.msgSQL + " WHERE m.chat = ? AND m.id = ?", [chat, id]) { m = Store.message(from: $0) }
         return m
+    }
+
+    /// Newest message of a kind in a chat (dev hooks).
+    func latestID(chat: String, kind: MessageKind) -> String? {
+        var id: String?
+        query("SELECT id FROM messages WHERE chat = ? AND kind = ? ORDER BY ts DESC LIMIT 1", [chat, kind.rawValue]) { id = $0.str(0) }
+        return id
     }
 
     func unreadIncoming(chat: String, limit: Int) -> [String] {

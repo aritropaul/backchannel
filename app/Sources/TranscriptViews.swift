@@ -91,6 +91,8 @@ final class BubbleView: NSView {
     }
     var highlight = false { didSet { if highlight != oldValue { needsDisplay = true } } }
     weak var controller: ConversationViewController?
+    /// A video playing in place over this bubble's thumbnail.
+    weak var playerView: NSView?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -106,6 +108,7 @@ final class BubbleView: NSView {
 
     private func itemChanged(from old: MessageLayout?) {
         guard let item else { badge.isHidden = true; return }
+        if let p = playerView, let r = item.mediaRect, old?.msg.id == item.msg.id { p.frame = r }
         let sameMessage = old?.msg.id == item.msg.id && old !== item
         // Crossfade content swaps in place; if the geometry moved, a fade would ghost.
         if sameMessage, let old, old.msg != item.msg, old.bubble == item.bubble, old.mediaRect == item.mediaRect {

@@ -1,5 +1,7 @@
 import AppKit
+import AVFoundation
 import ImageIO
+import UniformTypeIdentifiers
 
 nonisolated struct UncheckedBox<T>: @unchecked Sendable { let value: T }
 
@@ -37,6 +39,7 @@ final class ImageCache {
     }
 
     nonisolated static func decode(_ url: URL, px: Int) -> CGImage? {
+        if let t = UTType(filenameExtension: url.pathExtension), t.conforms(to: .movie) { return posterFrame(url, px: px) }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -45,6 +48,21 @@ final class ImageCache {
             kCGImageSourceThumbnailMaxPixelSize: px,
         ]
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
+    /// A downloaded video's frame half a second in, for its bubble's poster.
+    nonisolated static func posterFrame(_ url: URL, px: Int) -> CGImage? {
+        let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: px, height: px)
+        let done = DispatchSemaphore(value: 0)
+        let out = UncheckedBox(value: NSMutableArray())
+        gen.generateCGImageAsynchronously(for: CMTime(seconds: 0.5, preferredTimescale: 600)) { img, _, _ in
+            if let img { out.value.add(img) }
+            done.signal()
+        }
+        done.wait()
+        return out.value.firstObject.map { $0 as! CGImage }
     }
 
     /// Inline JPEG thumbnails are tiny; decode synchronously.

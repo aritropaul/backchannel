@@ -269,6 +269,15 @@ final class ChatCellView: NSTableCellView {
         time.textColor = selected ? Theme.onSelectionSecondary : .secondaryLabelColor
         preview.textColor = selected ? Theme.onSelectionSecondary : .secondaryLabelColor
         muted.contentTintColor = selected ? Theme.onSelectionSecondary : .tertiaryLabelColor
+        if let hit {
+            let a = NSMutableAttributedString(string: hit.text, attributes: [.font: preview.font ?? .systemFont(ofSize: 13),
+                                                                               .foregroundColor: preview.textColor ?? .secondaryLabelColor])
+            for r in hit.ranges where NSMaxRange(r) <= a.length {
+                a.addAttributes([.foregroundColor: selected ? Theme.onSelection : NSColor.labelColor,
+                                 .font: NSFont.systemFont(ofSize: 13, weight: .semibold)], range: r)
+            }
+            preview.attributedStringValue = a
+        }
         if let c = chat {
             effectiveAppearance.performAsCurrentDrawingAppearance {
                 dot.layer?.backgroundColor = (c.isMuted ? NSColor.tertiaryLabelColor : Theme.accent).cgColor
@@ -276,9 +285,37 @@ final class ChatCellView: NSTableCellView {
         }
     }
 
+    /// Set when the row shows a message search result: the snippet with its matched ranges.
+    private var hit: (text: String, ranges: [NSRange])?
+
+    /// Shows a message search result: the chat's avatar and name, the message's
+    /// date, and "Sender: snippet" with the matched words emphasised.
+    func configure(hit h: Store.SearchHit, in c: Chat) {
+        chat = c
+        typing = false
+        name.stringValue = c.name
+        time.stringValue = Fmt.listStamp(h.date)
+        dot.isHidden = true
+        muted.isHidden = true
+        var text = c.isGroup || h.fromMe ? "\(h.senderName): " : ""
+        var ranges: [NSRange] = []
+        var open: Int?
+        for ch in h.snippet {
+            if ch == "\u{2}" { open = (text as NSString).length; continue }
+            if ch == "\u{3}", let o = open { ranges.append(NSRange(location: o, length: (text as NSString).length - o)); open = nil; continue }
+            text.append(ch)
+        }
+        hit = (text.replacingOccurrences(of: "\n", with: " "), ranges)
+        avatar.load(c, px: 80)
+        applyColors()
+        setAccessibilityLabel("\(c.name), \(text)")
+        needsLayout = true
+    }
+
     func configure(_ c: Chat, typing: Bool) {
-        let changed = chat?.jid == c.jid && (chat != c || self.typing != typing)
+        let changed = chat?.jid == c.jid && hit == nil && (chat != c || self.typing != typing)
         if changed { Motion.crossfade(layer) }
+        hit = nil
         chat = c
         self.typing = typing
         name.stringValue = c.name
@@ -466,5 +503,23 @@ final class ListLinkCellView: NSTableCellView {
             label.textColor = sel ? Theme.onSelection : .labelColor
             icon.contentTintColor = sel ? Theme.onSelectionSecondary : .secondaryLabelColor
         }
+    }
+}
+
+/// "Conversations" / "Messages" label above each group of search results.
+final class SectionHeaderView: NSTableCellView {
+    let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        addSubview(label)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        label.frame = NSRect(x: 14, y: 4, width: bounds.width - 28, height: 16)
     }
 }

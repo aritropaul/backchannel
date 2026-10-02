@@ -558,7 +558,7 @@ final class MessageLayout {
 
     /// Full image if decoded, else the inline thumbnail. Kicks off decoding once.
     func image(onLoad: @escaping () -> Void) -> NSImage? {
-        if !msg.mediaPath.isEmpty, msg.kind == .image || msg.kind == .sticker, let r = mediaRect {
+        if !msg.mediaPath.isEmpty, msg.kind == .image || msg.kind == .sticker || msg.kind == .video, let r = mediaRect {
             let px = Int(max(r.width, r.height) * 2)
             if let img = ImageCache.shared.cached(msg.mediaPath, px: px) { return img }
             ImageCache.shared.load(msg.mediaPath, px: px) { img in if img != nil { onLoad() } }

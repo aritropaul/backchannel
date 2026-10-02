@@ -23,10 +23,7 @@ enum Theme {
     /// pair (pale green / deep green); any other accent gets the same lightness and relative
     /// chroma at the accent's hue, so the ink colors below stay legible.
     static let bubbleOut = NSColor(name: "bubbleOut") { @Sendable ap in
-        let dark = ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        var accent: NSColor?
-        ap.performAsCurrentDrawingAppearance { accent = NSColor.controlAccentColor.usingColorSpace(.sRGB) }
-        return OKLCH.bubble(accent: accent, dark: dark)
+        OKLCH.bubble(accent: resolvedAccent(ap), dark: ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
     }
     /// Large selected fills (sidebar rows, pinned tiles) wear the bubble tone with bubble ink,
     /// as WhatsApp does for its selected chips; the solid accent is kept for small marks.
@@ -41,8 +38,75 @@ enum Theme {
     static var inkIn: NSColor { .labelColor }
     static var meta: NSColor { .secondaryLabelColor }
     /// The one app color: unread dots, send arrow, "You" quotes, selection, switches, and
-    /// (via bubbleOut) my messages. The AccentColor asset makes it WhatsApp green by default.
-    static var accent: NSColor { .controlAccentColor }
+    /// (via bubbleOut) my messages. Picked in Settings; WhatsApp green by default. Dynamic,
+    /// so anything holding it re-resolves to the current choice on its next draw.
+    static let accent = NSColor(name: "accent") { @Sendable ap in resolvedAccent(ap) ?? NSColor(hex: 0x1DAA61) }
+
+    enum AccentChoice: String, CaseIterable, Sendable {
+        case whatsapp, system, blue, purple, pink, red, orange, yellow, green, graphite
+
+        var title: String {
+            switch self {
+            case .whatsapp: "WhatsApp Green"
+            case .system: "Match System"
+            default: rawValue.capitalized
+            }
+        }
+
+        /// macOS's own accent index, so AppKit controls (switches, focus rings) agree.
+        var appleAccentIndex: Int? {
+            switch self {
+            case .red: 0
+            case .orange: 1
+            case .yellow: 2
+            case .green: 3
+            case .blue: 4
+            case .purple: 5
+            case .pink: 6
+            case .graphite: -1
+            case .whatsapp, .system: nil
+            }
+        }
+
+        nonisolated var color: NSColor {
+            switch self {
+            case .whatsapp: NSColor(hex: 0x1DAA61)
+            case .system: .controlAccentColor
+            case .blue: .systemBlue
+            case .purple: .systemPurple
+            case .pink: .systemPink
+            case .red: .systemRed
+            case .orange: .systemOrange
+            case .yellow: .systemYellow
+            case .green: .systemGreen
+            case .graphite: .systemGray
+            }
+        }
+    }
+
+    static let accentDidChange = Notification.Name("WA.accentDidChange")
+    nonisolated private static let accentKey = "WA.accent"
+
+    nonisolated static var accentChoice: AccentChoice {
+        UserDefaults.standard.string(forKey: accentKey).flatMap(AccentChoice.init) ?? .whatsapp
+    }
+
+    static func setAccent(_ c: AccentChoice) {
+        UserDefaults.standard.set(c.rawValue, forKey: accentKey)
+        // App-domain override of the system accent, for the controls AppKit draws itself.
+        if let i = c.appleAccentIndex {
+            UserDefaults.standard.set(i, forKey: "AppleAccentColor")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "AppleAccentColor")
+        }
+        NotificationCenter.default.post(name: accentDidChange, object: nil)
+    }
+
+    nonisolated private static func resolvedAccent(_ ap: NSAppearance) -> NSColor? {
+        var out: NSColor?
+        ap.performAsCurrentDrawingAppearance { out = accentChoice.color.usingColorSpace(.sRGB) }
+        return out
+    }
     static var failed: NSColor { .systemRed }
 
     static func ink(fromMe: Bool) -> NSColor { fromMe ? inkOut : inkIn }

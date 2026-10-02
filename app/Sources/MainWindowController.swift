@@ -81,11 +81,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             return self.convo.capsuleTakesClick(at: e.locationInWindow) ? nil : e
         }
         // Changing the accent (System Settings › Appearance) recolors the whole app, bubbles included.
-        NotificationCenter.default.addObserver(forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.isShowingMain else { return }
-                self.list.reload()
-                self.window?.contentView?.superview?.redisplayTree()
+        for name in [NSColor.systemColorsDidChangeNotification, Theme.accentDidChange] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.isShowingMain else { return }
+                    self.list.reload()
+                    self.window?.contentView?.superview?.redisplayTree()
+                }
             }
         }
 
@@ -204,6 +206,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         guard chat?.jid != convo.chat?.jid || convo.isComposing else { return }
         convo.open(chat)
         if !Core.shared.isPreview { UserDefaults.standard.set(chat?.jid, forKey: "WA.lastChat") }
+    }
+
+    func chatList(didSelectMessage id: String, in chat: Chat) {
+        if chat.jid != convo.chat?.jid || convo.isComposing { convo.open(chat) }
+        convo.jump(to: id)
     }
 
     func open(chat jid: String) {

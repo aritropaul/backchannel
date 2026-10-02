@@ -21,27 +21,29 @@ import (
 
 // req is the single command envelope Swift sends through WACall.
 type req struct {
-	Op      string `json:"op"`
-	Chat    string `json:"chat"`
-	ID      string `json:"id"`
-	Text    string `json:"text"`
-	Quote   string `json:"quote"`
-	Emoji   string `json:"emoji"`
-	On      bool   `json:"on"`
-	Hours   int    `json:"hours"`
-	Path    string `json:"path"`
-	Thumb   string `json:"thumb"`
-	Width   int    `json:"width"`
-	Height  int    `json:"height"`
-	Mime    string `json:"mime"`
-	Active  bool   `json:"active"`
-	Dir     string `json:"dir"`
-	Phone   string `json:"phone"`
-	Seconds int    `json:"seconds"`
-	Wave    string `json:"waveform"` // base64, 64 bytes
-	LinkURL string `json:"link_url"`
+	Op        string `json:"op"`
+	Chat      string `json:"chat"`
+	ID        string `json:"id"`
+	Text      string `json:"text"`
+	Quote     string `json:"quote"`
+	Emoji     string `json:"emoji"`
+	On        bool   `json:"on"`
+	Hours     int    `json:"hours"`
+	Path      string `json:"path"`
+	Thumb     string `json:"thumb"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	Mime      string `json:"mime"`
+	Active    bool   `json:"active"`
+	Dir       string `json:"dir"`
+	Phone     string `json:"phone"`
+	Seconds   int    `json:"seconds"`
+	Wave      string `json:"waveform"` // base64, 64 bytes
+	LinkURL   string `json:"link_url"`
 	LinkTitle string `json:"link_title"`
 	LinkDesc  string `json:"link_desc"`
+	Name      string `json:"name"`  // file name shown to the recipient
+	Bytes     int    `json:"bytes"` // video_prefix: how much of the file to fetch
 }
 
 func call(raw []byte) (out any) {
@@ -71,6 +73,18 @@ func call(raw []byte) (out any) {
 		res, err = a.profile(r.Chat)
 	case "send_image":
 		res, err = a.sendImage(r)
+	case "send_file":
+		res, err = a.sendFile(r)
+	case "backfill":
+		go a.backfill(r.Chat)
+	case "thumb":
+		go a.fetchThumb(r.Chat, r.ID)
+	case "video_prefix":
+		res, err = a.videoPrefix(r.Chat, r.ID, r.Bytes)
+	case "set_thumb":
+		err = a.setThumb(r.Chat, r.ID, r.Thumb)
+	case "set_waveform":
+		err = a.setWaveform(r.Chat, r.ID, r.Wave)
 	case "react":
 		err = a.react(r.Chat, r.ID, r.Emoji)
 	case "edit":
@@ -634,6 +648,7 @@ func (a *App) profile(chatS string) (any, error) {
 				"admin": p.IsAdmin || p.IsSuperAdmin, "owner": p.IsSuperAdmin})
 		}
 		out["participants"] = people
+		a.events <- groupSize{j.String(), len(g.Participants)}
 	} else {
 		if info, err := a.cli.GetUserInfo(a.ctx, []types.JID{j}); err == nil {
 			for _, u := range info {
@@ -727,4 +742,171 @@ func (a *App) sendImage(r req) (any, error) {
 		a.deliver(chat, id, &waE2E.Message{ImageMessage: img})
 	}()
 	return map[string]any{"id": id}, nil
+}
+
+// sendFile sends a video (mp4 with a thumbnail) or any other file as a document.
+func (a *App) sendFile(r req) (any, error) {
+	if err := a.ready(); err != nil {
+		return nil, err
+	}
+	chat, err := parseChat(r.Chat)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(r.Path)
+	if err != nil {
+		return nil, err
+	}
+	name := r.Name
+	if name == "" {
+		name = filepath.Base(r.Path)
+	}
+	mime := r.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	video := strings.HasPrefix(mime, "video/") && r.Thumb != ""
+	var thumb []byte
+	if r.Thumb != "" {
+		thumb, _ = os.ReadFile(r.Thumb)
+	}
+	id := a.cli.GenerateMessageID()
+	local := filepath.Join(a.dir, "media", safeName(id)+filepath.Ext(r.Path))
+	os.WriteFile(local, data, 0o600)
+	row := &msgRow{Chat: chat.String(), ID: id, Sender: a.me().String(), FromMe: true, TS: time.Now().UnixMilli(),
+		Kind: KDocument, Text: strings.TrimSpace(r.Text), Status: StPending, Mime: mime, FileName: name,
+		FileSize: int64(len(data)), MediaPath: local, Thumb: thumb}
+	if video {
+		row.Kind, row.FileName = KVideo, ""
+		row.Width, row.Height, row.Seconds = r.Width, r.Height, r.Seconds
+	}
+	ci := a.quoteContext(chat, r.Quote)
+	if ci != nil {
+		row.QuoteID, row.QuoteSender = r.Quote, ci.GetParticipant()
+		a.rdb.QueryRow(`SELECT text, kind FROM messages WHERE chat=? AND id=?`, chat.String(), r.Quote).Scan(&row.QuoteText, &row.QuoteKind)
+	}
+	a.localEcho(row, chat)
+	go func() {
+		mt := whatsmeow.MediaDocument
+		if video {
+			mt = whatsmeow.MediaVideo
+		}
+		up, err := a.cli.Upload(a.ctx, data, mt)
+		if err != nil {
+			a.log.Errorf("upload %s: %v", id, err)
+			a.db.Exec(`UPDATE messages SET status=? WHERE chat=? AND id=?`, StFailed, chat.String(), id)
+			a.touchMsg(chat.String(), id)
+			return
+		}
+		var caption *string
+		if row.Text != "" {
+			caption = proto.String(row.Text)
+		}
+		msg := &waE2E.Message{}
+		if video {
+			v := &waE2E.VideoMessage{
+				Caption: caption, Mimetype: proto.String(mime),
+				URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+				Seconds: proto.Uint32(uint32(r.Seconds)), Width: proto.Uint32(uint32(r.Width)), Height: proto.Uint32(uint32(r.Height)),
+				JPEGThumbnail: thumb, ContextInfo: ci,
+			}
+			msg.VideoMessage = v
+			a.db.Exec(`UPDATE messages SET media=? WHERE chat=? AND id=?`, refFor(v, "video"), chat.String(), id)
+		} else {
+			d := &waE2E.DocumentMessage{
+				Caption: caption, Mimetype: proto.String(mime), Title: proto.String(name), FileName: proto.String(name),
+				URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+				ContextInfo: ci,
+			}
+			if len(thumb) > 0 {
+				d.JPEGThumbnail = thumb
+			}
+			msg.DocumentMessage = d
+			a.db.Exec(`UPDATE messages SET media=? WHERE chat=? AND id=?`, refFor(d, "document"), chat.String(), id)
+		}
+		a.deliver(chat, id, msg)
+	}()
+	return map[string]any{"id": id}, nil
+}
+
+// backfill re-requests, from the phone, history around messages imported
+// before we stored link previews and voice waveforms. The phone resends the
+// original messages (with the sender's own preview and waveform) and the
+// upsert fills the empty columns. Once per chat per session, at most a few
+// requests of 50 messages each.
+func (a *App) backfill(chatS string) {
+	if _, done := a.backfilled.LoadOrStore(chatS, true); done {
+		return
+	}
+	chat, err := parseChat(chatS)
+	if err != nil {
+		return
+	}
+	if a.ready() != nil {
+		// Opened before the connection came up: run once connected.
+		a.backfilled.Delete(chatS)
+		a.backfillPending.Store(chatS, true)
+		return
+	}
+	rows, err := a.rdb.Query(`SELECT ts FROM messages WHERE chat=? AND
+		((kind=? AND link_title='' AND (text LIKE '%http://%' OR text LIKE '%https://%')) OR (kind=? AND waveform IS NULL))
+		ORDER BY ts DESC LIMIT 300`, chatS, KText, KVoice)
+	if err != nil {
+		return
+	}
+	var gaps []int64
+	for rows.Next() {
+		var ts int64
+		if rows.Scan(&ts) == nil {
+			gaps = append(gaps, ts)
+		}
+	}
+	rows.Close()
+	covered := int64(1 << 62)
+	sent := 0
+	for _, ts := range gaps {
+		if ts >= covered || sent >= 4 {
+			continue
+		}
+		// Anchor on the message right after the gap: the phone answers with
+		// the 50 messages before the anchor, which include the gap.
+		var id, sender string
+		var ats int64
+		var fromMe int
+		if a.rdb.QueryRow(`SELECT id, sender, from_me, ts FROM messages WHERE chat=? AND ts > ? AND kind != ? ORDER BY ts ASC LIMIT 1`,
+			chatS, ts, KPending).Scan(&id, &sender, &fromMe, &ats) != nil {
+			continue // the newest message: nothing after it to anchor on
+		}
+		var oldest int64
+		a.rdb.QueryRow(`SELECT MIN(ts) FROM (SELECT ts FROM messages WHERE chat=? AND ts < ? ORDER BY ts DESC LIMIT 50)`,
+			chatS, ats).Scan(&oldest)
+		covered = oldest
+		sj, _ := types.ParseJID(sender)
+		info := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: chat, Sender: sj, IsFromMe: fromMe == 1, IsGroup: chat.Server == types.GroupServer},
+			ID:            id,
+			Timestamp:     time.UnixMilli(ats),
+		}
+		if _, err := a.cli.SendPeerMessage(a.ctx, a.cli.BuildHistorySyncRequest(info, 50)); err != nil {
+			a.log.Errorf("backfill %s: %v", chatS, err)
+			return
+		}
+		sent++
+		a.log.Infof("backfill %s: requested 50 before %s", chatS, id)
+		time.Sleep(time.Second)
+	}
+}
+
+// setWaveform stores a waveform the app computed from a downloaded voice note
+// whose sender didn't include one.
+func (a *App) setWaveform(chat, id, b64 string) error {
+	wave, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(wave) == 0 {
+		return errors.New("bad waveform")
+	}
+	a.db.Exec(`UPDATE messages SET waveform=? WHERE chat=? AND id=? AND waveform IS NULL`, wave, chat, id)
+	a.touchMsg(chat, id)
+	return nil
 }

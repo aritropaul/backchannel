@@ -18,17 +18,18 @@ final class DropView: NSView {
         dirtyRect.fill()
     }
 
-    private func imageURL(_ info: NSDraggingInfo) -> URL? {
-        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.image.identifier]]
-        return (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: opts) as? [URL])?.first
+    private func fileURL(_ info: NSDraggingInfo) -> URL? {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: opts) as? [URL])?
+            .first { !$0.hasDirectoryPath }
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        imageURL(sender) != nil && onDrop != nil ? .copy : []
+        fileURL(sender) != nil && onDrop != nil ? .copy : []
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let url = imageURL(sender) else { return false }
+        guard let url = fileURL(sender) else { return false }
         onDrop?(url)
         return true
     }
@@ -88,7 +89,13 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     private var reloading = false
     private var replyTo: Message?
     private var editing: Message?
-    private var pendingImage: (path: String, thumb: String, w: Int, h: Int)?
+    var pendingImage: (path: String, thumb: String, w: Int, h: Int)?
+    var pendingFile: PendingFile?
+    var inlineVideo: InlineVideo?
+    var waveformTried: Set<String> = []
+    var thumbRequested: Set<String> = []
+    var posterQueue: [(chat: String, id: String)] = []
+    var postersInFlight = 0
     private var drafts: [String: String] = [:]
     private var lastTypingSent = Date.distantPast
     private var typingStop: DispatchWorkItem?
@@ -99,7 +106,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     private var highlighted: String?
 
     private let scrollView = NSScrollView()
-    private let tableView = NSTableView()
+    let tableView = NSTableView()
     let composer = ComposerView()
     private let jumpButton = NSButton()
     private let emptyLabel = NSTextField(labelWithString: "")
@@ -116,7 +123,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
 
     override func loadView() {
         let root = DropView()
-        root.onDrop = { [weak self] url in self?.prepareImage(url) }
+        root.onDrop = { [weak self] url in self?.attach(url) }
         view = root
 
         scrollView.drawsBackground = false
@@ -235,6 +242,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     // MARK: open / load
 
     func open(_ c: Chat?) {
+        stopInline()
         if c != nil { endCompose() }
         saveDraft()
         chat = c
@@ -243,6 +251,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         replyTo = nil
         editing = nil
         pendingImage = nil
+        pendingFile = nil
         expanded = []
         layouts = [:]
         composer.hideReply(animated: false)
@@ -289,6 +298,8 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         Core.shared.call("focus", ["chat": c.jid, "active": NSApp.isActive])
         if c.hasUnread { Core.shared.call("mark_read", ["chat": c.jid]) }
         if !c.isGroup { Core.shared.call("subscribe", ["chat": c.jid]) }
+        // Ask the phone to resend history that predates stored link previews/waveforms (once per chat per session).
+        Core.shared.call("backfill", ["chat": c.jid])
     }
 
     func chatUpdated(_ c: Chat) {
@@ -650,7 +661,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         updateJump()
     }
 
-    private func rowIndex(of id: String) -> Int? {
+    func rowIndex(of id: String) -> Int? {
         rows.firstIndex { if case .message(let l) = $0 { return l.msg.id == id }; return false }
     }
 
@@ -817,8 +828,11 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             v.identifier = id
             v.controller = self
             v.item = l
+            if v.playerView != nil, inlineVideo?.id != l.msg.id { stopInline() }   // its cell was reused
             v.highlight = l.msg.id == highlighted
             if l.wantsAutoDownload { Core.shared.call("download", ["chat": chat?.jid ?? "", "id": l.msg.id]) }
+            fillWaveformIfNeeded(l.msg)
+            requestThumbIfNeeded(l.msg)
             return v
         }
     }
@@ -891,6 +905,15 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
+    /// Dev hook: plays the newest downloaded video in the open chat.
+    func playLatestVideo() {
+        guard let c = chat, let id = store.latestID(chat: c.jid, kind: .video), let m = store.message(chat: c.jid, id: id) else {
+            NSLog("WA video: none in chat"); return
+        }
+        jump(to: id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.open(media: m) }
+    }
+
     func open(media m: Message) {
         if m.kind == .voice || m.kind == .audio {
             toggleVoice(m)
@@ -903,7 +926,9 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         guard m.hasMedia || !m.mediaPath.isEmpty else { return }
         if !m.mediaPath.isEmpty, FileManager.default.fileExists(atPath: m.mediaPath) {
             let url = URL(fileURLWithPath: m.mediaPath)
-            if m.kind == .image || m.kind == .video || m.kind == .sticker {
+            if m.kind == .video {
+                playInline(m, url: url)
+            } else if m.kind == .image || m.kind == .sticker {
                 previewURL = url
                 if let panel = QLPreviewPanel.shared() {
                     if panel.isVisible { panel.reloadData() } else { panel.makeKeyAndOrderFront(nil) }
@@ -1011,7 +1036,11 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             return
         }
         var res: [String: Any]
-        if let img = pendingImage {
+        if let f = pendingFile {
+            res = Core.shared.call("send_file", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime, "text": trimmed,
+                                                 "thumb": f.thumb ?? "", "width": f.width, "height": f.height,
+                                                 "seconds": f.seconds, "quote": replyTo?.id ?? ""])
+        } else if let img = pendingImage {
             res = Core.shared.call("send_image", ["chat": c.jid, "path": img.path, "thumb": img.thumb, "width": img.w, "height": img.h,
                                                   "mime": "image/jpeg", "text": trimmed, "quote": replyTo?.id ?? ""])
         } else {
@@ -1032,6 +1061,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         drafts[c.jid] = nil
         replyTo = nil
         pendingImage = nil
+        pendingFile = nil
         composer.hideReply(animated: true)
         composer.hideAttachment(animated: true)
         typingStop?.cancel()
@@ -1073,11 +1103,12 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     func composerAttach() {
         guard let window = view.window else { return }
         let p = NSOpenPanel()
-        p.allowedContentTypes = [.image]
+        p.allowedContentTypes = [.item]
         p.allowsMultipleSelection = false
+        p.message = "Photos and videos send inline; anything else goes as a document."
         p.beginSheetModal(for: window) { [weak self] resp in
             guard resp == .OK, let url = p.url else { return }
-            MainActor.assumeIsolated { self?.prepareImage(url) }
+            MainActor.assumeIsolated { self?.attach(url) }
         }
     }
 
@@ -1090,6 +1121,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
 
     func composerCancelAttachment() {
         pendingImage = nil
+        pendingFile = nil
         composer.hideAttachment(animated: true)
     }
 

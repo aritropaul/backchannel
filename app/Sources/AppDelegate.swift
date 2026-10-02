@@ -3,6 +3,7 @@ import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var wc: MainWindowController?
+    private lazy var settings = SettingsWindowController()
     private var store: Store?
     private var badgeScheduled = false
 
@@ -42,6 +43,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         if env["WA_FOCUS_LIST"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak main] in main?.list.focusList() }
+        }
+        if let q = env["WA_SEARCH"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak main] in main?.list.setSearch(q) }
+            if env["WA_SEARCH_PICK"] != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFirstHit() }
+            }
+        }
+        if let path = env["WA_ATTACH"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak main] in main?.convo.attach(URL(fileURLWithPath: path)) }
+        }
+        if let id = env["WA_JUMP"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.convo.jump(to: id) }
+        }
+        if env["WA_PLAY_LATEST_VIDEO"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.convo.playLatestVideo() }
+        }
+        if env["WA_PREVIEW_SETTINGS"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showSettings(nil) }
+        }
+        if env["WA_TEST_NOTIFY"] != nil {
+            // Verifies notifications end to end: logs the permission, posts one, then logs what macOS delivered.
+            Task {
+                let nc = UNUserNotificationCenter.current()
+                NSLog("WA notify: authorization before = %ld", (await nc.notificationSettings()).authorizationStatus.rawValue)
+                SettingsWindowController.postTestNotification()
+                try? await Task.sleep(for: .seconds(2))
+                let s = await nc.notificationSettings()
+                let delivered = await nc.deliveredNotifications()
+                NSLog("WA notify: authorization = %ld, alert = %ld, delivered = %ld", s.authorizationStatus.rawValue,
+                      s.alertSetting.rawValue, delivered.count)
+            }
         }
         if env["WA_PREVIEW_COMPOSE"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak main] in main?.newMessage(nil) }
@@ -146,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: menu actions
 
     @objc func newMessage(_ sender: Any?) { wc?.newMessage(sender) }
+    @objc func showSettings(_ sender: Any?) { settings.showWindow(sender) }
     @objc func nextChat(_ sender: Any?) { wc?.list.selectRelative(1) }
     @objc func previousChat(_ sender: Any?) { wc?.list.selectRelative(-1) }
     @objc func searchChats(_ sender: Any?) { wc?.list.focusSearch() }
@@ -206,6 +239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         _ = menu("WA", [
             item("About WA", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
+            .separator(),
+            item("Settings…", #selector(showSettings(_:)), ",", target: self),
             .separator(),
             item("Log Out of WhatsApp…", #selector(logOut(_:)), target: self),
             .separator(),
