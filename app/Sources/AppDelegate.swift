@@ -54,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFirstHit() }
             }
         }
+        if let f = env["WA_FILTER"].flatMap(Int.init) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFilter(f) }
+        }
         if let path = env["WA_ATTACH"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak main] in main?.convo.attach(URL(fileURLWithPath: path)) }
         }

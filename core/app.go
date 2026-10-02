@@ -339,16 +339,25 @@ func (a *App) flush() {
 	}
 }
 
-// statsLoop logs resource use every 10s so slow syncs and leaks show up in core.log.
+// statsLoop logs resource use so slow syncs and leaks show up in core.log:
+// every 10s while messages are flowing, every minute once they stop, so an
+// idle app isn't woken six times a minute to log the same line.
 func (a *App) statsLoop() {
 	var ms runtime.MemStats
 	var lastMsgs int64
-	for range time.Tick(10 * time.Second) {
+	every := 10 * time.Second
+	for {
+		time.Sleep(every)
 		runtime.ReadMemStats(&ms)
 		msgs := a.statMsgs.Load()
-		a.log.Infof("stats heap=%dMB sys=%dMB goroutines=%d queue=%d/%d msgs=%d (+%d/10s) convs=%d",
+		a.log.Infof("stats heap=%dMB sys=%dMB goroutines=%d queue=%d/%d msgs=%d (+%d/%s) convs=%d",
 			ms.HeapAlloc>>20, ms.Sys>>20, runtime.NumGoroutine(), len(a.events), cap(a.events),
-			msgs, msgs-lastMsgs, a.statConvs.Load())
+			msgs, msgs-lastMsgs, every, a.statConvs.Load())
+		if msgs != lastMsgs || len(a.events) > 0 {
+			every = 10 * time.Second
+		} else {
+			every = time.Minute
+		}
 		lastMsgs = msgs
 	}
 }

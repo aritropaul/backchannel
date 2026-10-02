@@ -213,7 +213,9 @@ final class Store {
     }
 
     /// Full-text search over every chat's messages (text and file names), newest first.
-    /// Each word matches as a prefix; all words must match.
+    /// Each word matches as a prefix; all words must match. The FTS rowid is the
+    /// message's rowid (the triggers insert it that way), so the join is an integer
+    /// lookup: a one-letter query (~24k matches) takes ~8ms instead of ~45ms.
     func searchMessages(_ q: String, limit: Int = 60) -> [SearchHit] {
         let words = q.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
         guard !words.isEmpty else { return [] }
@@ -223,7 +225,7 @@ final class Store {
             SELECT m.chat, m.id, m.ts, m.from_me, m.sender, snippet(messages_fts, -1, char(2), char(3), '…', 14),
                    sc.name, sc.push_name, m.push_name
             FROM messages_fts f
-            JOIN messages m ON m.chat = f.chat AND m.id = f.id
+            JOIN messages m ON m.rowid = f.rowid
             LEFT JOIN contacts sc ON sc.jid = m.sender
             WHERE messages_fts MATCH ? AND m.kind != 10
             ORDER BY m.ts DESC LIMIT ?

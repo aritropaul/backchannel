@@ -57,7 +57,20 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     private var all: [Chat] = []
     private var showingArchived = false
     private var filter = 0
-    private var query = ""
+    private var query = "" {
+        didSet {
+            guard query.isEmpty else { return }
+            hits = []
+            searchedQuery = ""
+            pendingSearch?.cancel()
+            pendingSearch = nil
+        }
+    }
+    /// Message results for `searchedQuery`. List reloads (every incoming message)
+    /// reuse them; the full-text search only reruns when the query changes.
+    private var hits: [Store.SearchHit] = []
+    private var searchedQuery = ""
+    private var pendingSearch: DispatchWorkItem?
     private(set) var selectedJID: String?
     /// The picked message search result, so reloads keep it selected.
     private var selectedHit: String?
@@ -93,8 +106,12 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         search.translatesAutoresizingMaskIntoConstraints = false
 
         filters.onChange = { [weak self] i in
-            self?.filter = i
-            self?.rebuildItems(animated: false)
+            guard let self else { return }
+            self.filter = i
+            // Unread opens with nothing selected: the chat you were reading has
+            // no unread messages, so it doesn't belong in that list.
+            if i == 1 { self.select(jid: nil) }
+            self.rebuildItems(animated: false)
         }
 
         status.font = .systemFont(ofSize: 11)
@@ -198,8 +215,9 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             out += list.map { .chat($0) }
         } else {
             // Search: matching conversations, then matching messages across every chat.
+            // Message hits stay from the last search until the next one lands, so
+            // they don't blink out on every keystroke.
             if !list.isEmpty { out.append(.header("Conversations")); out += list.map { .chat($0) } }
-            let hits = store.searchMessages(query)
             if !hits.isEmpty { out.append(.header("Messages")); out += hits.map { .hit($0) } }
         }
         applyItems(out, animated: animated)
@@ -332,6 +350,11 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         search.stringValue = q
         searchChanged()
     }
+    /// Dev hook: picks a filter segment (0 All, 1 Unread, 2 Groups), as a click would.
+    func pickFilter(_ i: Int) {
+        filters.select(i, animated: false)
+        filters.onChange?(i)
+    }
     /// Dev hook: picks the first message result, as a click would.
     func pickFirstHit() {
         guard let i = items.firstIndex(where: { if case .hit = $0 { return true }; return false }) else { return }
@@ -364,6 +387,28 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     @objc private func searchChanged() {
         query = search.stringValue.trimmingCharacters(in: .whitespaces)
         if query.isEmpty { selectedHit = nil }
+        rebuildItems(animated: false)
+        scheduleMessageSearch()
+    }
+
+    /// Conversations filter as you type; the message search waits for a 150ms
+    /// pause, so a burst of keystrokes costs one query instead of one each.
+    private func scheduleMessageSearch() {
+        pendingSearch?.cancel()
+        pendingSearch = nil
+        guard !query.isEmpty, query != searchedQuery else { return }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.runMessageSearch() }
+        }
+        pendingSearch = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func runMessageSearch() {
+        pendingSearch = nil
+        guard !query.isEmpty else { return }
+        searchedQuery = query
+        hits = store.searchMessages(query)
         rebuildItems(animated: false)
     }
 

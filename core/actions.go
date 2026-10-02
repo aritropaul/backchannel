@@ -860,7 +860,9 @@ func (a *App) sendFile(r req) (any, error) {
 // before we stored link previews and voice waveforms. The phone resends the
 // original messages (with the sender's own preview and waveform) and the
 // upsert fills the empty columns. Once per chat per session, at most a few
-// requests of 50 messages each.
+// requests of 50 messages each. Each anchor is asked for once ever (kept in
+// kv): most gaps are links sent without a preview, which no resend can fill,
+// and they used to be re-requested on every launch.
 func (a *App) backfill(chatS string) {
 	if _, done := a.backfilled.LoadOrStore(chatS, true); done {
 		return
@@ -908,6 +910,11 @@ func (a *App) backfill(chatS string) {
 		a.rdb.QueryRow(`SELECT MIN(ts) FROM (SELECT ts FROM messages WHERE chat=? AND ts < ? ORDER BY ts DESC LIMIT 50)`,
 			chatS, ats).Scan(&oldest)
 		covered = oldest
+		key := "backfill:" + chatS + ":" + id
+		var asked string
+		if a.rdb.QueryRow(`SELECT v FROM kv WHERE k=?`, key).Scan(&asked) == nil {
+			continue // asked in an earlier session; whatever the phone had, it sent
+		}
 		sj, _ := types.ParseJID(sender)
 		info := &types.MessageInfo{
 			MessageSource: types.MessageSource{Chat: chat, Sender: sj, IsFromMe: fromMe == 1, IsGroup: chat.Server == types.GroupServer},
@@ -919,6 +926,7 @@ func (a *App) backfill(chatS string) {
 			return
 		}
 		sent++
+		a.db.Exec(`INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, key, itoa(int(time.Now().Unix())))
 		a.log.Infof("backfill %s: requested 50 before %s", chatS, id)
 		time.Sleep(time.Second)
 	}
