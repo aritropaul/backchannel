@@ -6,7 +6,8 @@ protocol ComposerDelegate: AnyObject {
     func composerSendVoice(_ r: VoiceRecorder.Result)
     func composerDidChangeHeight()
     func composerDidType()
-    func composerAttach()
+    func composerAttach(from anchor: NSView)
+    func composerExpressions(from anchor: NSView)
     func composerCancelReply()
     func composerCancelAttachment()
     func composerPasteImage(_ image: NSImage) -> Bool
@@ -208,8 +209,8 @@ final class ComposerView: NSView, NSTextViewDelegate {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        glassCircle(plusGlass, plusButton, "plus", "Attach a photo, video or file", #selector(attach))
-        glassCircle(emojiGlass, emojiButton, "face.smiling", "Emoji", #selector(emoji))
+        glassCircle(plusGlass, plusButton, "plus", "Attach", #selector(attach))
+        glassCircle(emojiGlass, emojiButton, "face.smiling", "Emoji, GIFs and Stickers", #selector(emoji))
 
         field.translatesAutoresizingMaskIntoConstraints = false
         field.cornerRadius = Self.control / 2
@@ -447,6 +448,15 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     func focus() { window?.makeFirstResponder(textView) }
+    /// The + button, which the attach menu opens above.
+    var attachAnchor: NSView { plusButton }
+    /// Puts an emoji at the insertion point, as if typed.
+    func insertEmoji(_ e: String) {
+        textView.insertText(e, replacementRange: textView.selectedRange())
+    }
+
+    /// The ☺ button, which the emoji, GIF and sticker panel opens above.
+    var expressionAnchor: NSView { emojiButton }
 
     // MARK: strips
 
@@ -558,11 +568,9 @@ final class ComposerView: NSView, NSTextViewDelegate {
         if textView.string.isEmpty { clearLink() }
     }
 
-    @objc private func attach() { delegate?.composerAttach() }
-    @objc private func emoji() {
-        focus()
-        NSApp.orderFrontCharacterPalette(nil)
-    }
+    @objc private func attach() { delegate?.composerAttach(from: plusButton) }
+    /// Emoji, GIFs and stickers (Emoji hands off to the system picker).
+    @objc private func emoji() { delegate?.composerExpressions(from: emojiButton) }
     @objc private func cancelReply() { delegate?.composerCancelReply() }
     @objc private func cancelAttachment() { delegate?.composerCancelAttachment() }
 

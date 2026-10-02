@@ -3,7 +3,7 @@ import AppKit
 /// Geometry + drawing for one message row, Messages-style. Built once per
 /// (message, width, flags); the table asks it for `height` and to `draw`.
 final class MessageLayout {
-    enum Hit { case link(URL), media, quote, readMore, file, retry, voice, none }
+    enum Hit { case link(URL), media, quote, readMore, file, retry, voice, card(RichCard.Hit), none }
 
     struct Flags: Equatable {
         var firstInRun = true
@@ -52,6 +52,9 @@ final class MessageLayout {
     private var cardTitleOrigin = CGPoint.zero
     private var cardDomainOrigin = CGPoint.zero
     private(set) var avatarRect: CGRect?
+    /// A poll, event or contact card inside the bubble.
+    private(set) var rich: RichCard?
+    private var richOrigin = CGPoint.zero
 
     /// Leading x for incoming content; groups reserve a gutter for avatars.
     private var lead: CGFloat { flags.gutter ? 50 : Self.edge }
@@ -87,7 +90,7 @@ final class MessageLayout {
         let maxBubble = min(max(width * 0.66, 200), 520, width - 80 - (flags.gutter ? 30 : 0))
         let fromMe = msg.fromMe
         var y: CGFloat = flags.firstInRun ? 10 : 2
-        if msg.reactions != nil { y += 10 }
+        if msg.reactions != nil { y += 22 }
 
         if flags.showSender {
             let s = TextBlock(NSAttributedString(string: msg.senderName, attributes: [.font: Theme.small, .foregroundColor: Theme.meta]),
@@ -170,8 +173,9 @@ final class MessageLayout {
         let failed = fromMe && msg.status == MessageStatus.failed
         if failed { parts.append("Not Delivered") } else if let s = flags.status { parts.append(s) }
         if !parts.isEmpty {
-            let f = TextBlock(NSAttributedString(string: parts.joined(separator: " · "),
-                                                 attributes: [.font: Theme.small, .foregroundColor: failed ? Theme.failed : Theme.meta]),
+            var attrs: [NSAttributedString.Key: Any] = [.font: Theme.small, .foregroundColor: failed ? Theme.failed : Theme.metaOnCanvas]
+            if let shadow = Theme.canvasTextShadow { attrs[.shadow] = shadow }
+            let f = TextBlock(NSAttributedString(string: parts.joined(separator: " · "), attributes: attrs),
                               maxWidth: 300, maxLines: 1)
             footer = f
             y += 3
@@ -187,12 +191,11 @@ final class MessageLayout {
 
     private func reactionAnchor(_ block: CGRect) {
         guard let r = msg.reactions else { return }
-        let label = r.total > 1 ? "\(r.emoji) \(r.total)" : r.emoji
-        let w = max(26, ceil(NSAttributedString(string: label, attributes: [.font: NSFont.systemFont(ofSize: 13)]).size().width) + 14)
-        let h: CGFloat = 24
+        let size = ReactionBadgeView.size(for: r)
+        let w = size.width, h = size.height
         // Incoming: top-right corner. Outgoing: top-left corner. Overlapping outward.
-        let x = msg.fromMe ? block.minX - w + 12 : block.maxX - 12
-        reactionRect = CGRect(x: min(max(4, x), width - w - 4), y: block.minY - 12, width: w, height: h)
+        let x = msg.fromMe ? block.minX - w + 10 : block.maxX - 10
+        reactionRect = CGRect(x: min(max(4, x), width - w - 4), y: block.minY - 22, width: w, height: h)
     }
 
     private func mediaSize(_ maxBubble: CGFloat) -> CGSize {
@@ -223,7 +226,14 @@ final class MessageLayout {
             y += quoteH + 5
         }
 
-        let isFile = msg.kind == .document || msg.kind == .contact
+        var richY: CGFloat = 0
+        if bodyOverride == nil, let rc = RichCard.make(msg: msg, width: min(maxText, 264)) {
+            rich = rc
+            richY = y
+            contentW = max(contentW, rc.size.width)
+            y += rc.size.height - Self.padV + 2
+        }
+        let isFile = rich == nil && (msg.kind == .document || msg.kind == .contact)
         var fileY: CGFloat = 0
         if isFile && bodyOverride == nil {
             let rowW = min(maxText, 240)
@@ -240,6 +250,7 @@ final class MessageLayout {
                 return msg.kind == .location ? locationText(o) : formatted(o)
             }
             if isFile { return (msg.kind == .contact || msg.text.isEmpty) ? nil : formatted(msg.text) }
+            if rich != nil { return nil }
             return bodyText()
         }()
         if let body {
@@ -263,6 +274,7 @@ final class MessageLayout {
         textOrigin = CGPoint(x: b.minX + textOrigin.x, y: b.minY + textOrigin.y + (h - y) / 2)
         if quoteH > 0 { quoteRect = CGRect(x: b.minX + 5, y: b.minY + 5, width: w - 10, height: quoteH) }
         if fileRect != nil { fileRect = CGRect(x: b.minX + 5, y: b.minY + fileY - 2, width: w - 10, height: 46) }
+        if rich != nil { richOrigin = CGPoint(x: b.minX + Self.padH, y: b.minY + richY) }
         return b.maxY
     }
 
@@ -528,8 +540,16 @@ final class MessageLayout {
 
     private func drawCard(_ r: CGRect) {
         let path = Self.bubblePath(r, fromMe: msg.fromMe, tail: flags.lastInRun)
-        Theme.bubbleIn.setFill()
-        path.fill()
+        if !msg.fromMe && Theme.frostsOverWallpaper {
+            Theme.glassTint.setFill()
+            path.fill()
+            Theme.glassRim.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        } else {
+            Theme.bubbleIn.setFill()
+            path.fill()
+        }
         if let img = thumbImage, let b = cardBanner ?? cardSquare {
             NSGraphicsContext.saveGraphicsState()
             path.addClip()
@@ -574,7 +594,8 @@ final class MessageLayout {
     var wantsAutoDownload: Bool {
         guard msg.hasMedia, msg.mediaPath.isEmpty else { return false }
         switch msg.kind {
-        case .image, .sticker: return Prefs.autoPhotos
+        case .sticker: return true   // tiny, and part of the conversation like text; WhatsApp always fetches them
+        case .image: return Prefs.autoPhotos
         case .voice, .audio: return Prefs.autoAudio
         case .document: return Prefs.autoDocuments
         default: return false
@@ -599,6 +620,7 @@ final class MessageLayout {
 
     func hit(_ p: CGPoint) -> Hit {
         if let f = failedRect, f.insetBy(dx: -4, dy: -4).contains(p) { return .retry }
+        if let rc = rich, let h = rc.hit(CGPoint(x: p.x - richOrigin.x, y: p.y - richOrigin.y)) { return .card(h) }
         if let t = text {
             let tp = CGPoint(x: p.x - textOrigin.x, y: p.y - textOrigin.y)
             if let url = t.link(at: tp) { return url == Self.readMoreURL ? .readMore : .link(url) }
@@ -609,6 +631,20 @@ final class MessageLayout {
         if let f = fileRect, f.contains(p) { return .file }
         if let q = quoteRect, q.contains(p) { return .quote }
         return .none
+    }
+
+    /// A card's buttons and options, in row coordinates.
+    var richClickRects: [CGRect] {
+        rich?.clickableRects.map { $0.offsetBy(dx: richOrigin.x, dy: richOrigin.y) } ?? []
+    }
+
+    /// The other person's bubble and link card outlines, for the frosted glass behind them.
+    var incomingShapes: [NSBezierPath] {
+        guard !msg.fromMe else { return [] }
+        var out: [NSBezierPath] = []
+        if let b = bubble { out.append(Self.bubblePath(b, fromMe: false, tail: tail)) }
+        if let c = cardRect { out.append(Self.bubblePath(c, fromMe: false, tail: flags.lastInRun)) }
+        return out
     }
 
     func contains(_ p: CGPoint) -> Bool {
@@ -623,14 +659,26 @@ final class MessageLayout {
 
     func draw(highlight: Bool, onImageLoad: @escaping () -> Void) {
         let fromMe = msg.fromMe
-        if let s = sender { s.draw(at: senderOrigin) }
+        if let s = sender {
+            Theme.drawChip(behind: CGRect(origin: senderOrigin, size: s.size))
+            s.draw(at: senderOrigin)
+        }
 
         if let m = mediaRect { drawMedia(m, onImageLoad: onImageLoad) }
 
         if let b = bubble {
             let path = Self.bubblePath(b, fromMe: fromMe, tail: tail)
-            (fromMe ? Theme.bubbleOut : Theme.bubbleIn).setFill()
-            path.fill()
+            if !fromMe && Theme.frostsOverWallpaper {
+                // The blur is a FrostView under this drawing; here its tint and edge.
+                Theme.glassTint.setFill()
+                path.fill()
+                Theme.glassRim.setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            } else {
+                (fromMe ? Theme.bubbleOut : Theme.bubbleIn).setFill()
+                path.fill()
+            }
             if highlight {
                 NSColor.black.withAlphaComponent(fromMe ? 0.15 : 0.08).setFill()
                 path.fill()
@@ -651,11 +699,17 @@ final class MessageLayout {
         }
 
         if let f = fileRect { drawFile(f) }
+        if let rc = rich { rc.draw(at: richOrigin, onImageLoad: onImageLoad) }
         if playRect != nil { drawVoice() }
-        if let t = text { t.draw(at: textOrigin) }
+        if let t = text {
+            if bubble == nil, msg.kind == .notice { Theme.drawChip(behind: CGRect(origin: textOrigin, size: t.size)) }
+            t.draw(at: textOrigin)
+        }
         if let c = cardRect { drawCard(c) }
         if let a = avatarRect { drawAvatar(a, onImageLoad: onImageLoad) }
-        if let f = footer { f.draw(at: footerOrigin) }
+        if let f = footer {
+            f.draw(at: footerOrigin)   // plain text, coloured for the wallpaper behind it
+        }
         if let fr = failedRect {
             let s = Self.symbol("exclamationmark.circle.fill", size: 16, color: Theme.failed)
             let sz = s.size()
@@ -718,7 +772,15 @@ final class MessageLayout {
                 img.draw(in: CGRect(x: m.midX - dw / 2, y: m.midY - dh / 2, width: dw, height: dh), from: .zero,
                          operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high.rawValue])
             }
-        } else if !sticker {
+        } else if sticker {
+            // Still downloading, or an animated (Lottie) sticker we can't draw: a quiet stand-in.
+            let r = m.insetBy(dx: 18, dy: 18)
+            NSColor.labelColor.withAlphaComponent(0.06).setFill()
+            NSBezierPath(roundedRect: r, xRadius: 22, yRadius: 22).fill()
+            let s = Self.symbol("face.smiling", size: 30, color: NSColor.tertiaryLabelColor)
+            let sz = s.size()
+            s.draw(at: CGPoint(x: r.midX - sz.width / 2, y: r.midY - sz.height / 2))
+        } else {
             Theme.bubbleIn.setFill()
             m.fill()
             if let sym = msg.kind.symbol {
@@ -727,7 +789,25 @@ final class MessageLayout {
                 s.draw(at: CGPoint(x: m.midX - sz.width / 2, y: m.midY - sz.height / 2))
             }
         }
-        if msg.kind == .video {
+        if msg.kind == .video && msg.fileName == "GIF" {
+            // A GIF (an mp4 WhatsApp plays silently on a loop): a "GIF" pill, not a play button.
+            let t = NSAttributedString(string: "GIF", attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .bold),
+                                                                   .foregroundColor: NSColor.white])
+            let ts = t.size()
+            let pill = CGRect(x: m.midX - (ts.width + 20) / 2, y: m.midY - 15, width: ts.width + 20, height: 30)
+            NSColor.black.withAlphaComponent(0.45).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: 15, yRadius: 15).fill()
+            t.draw(at: CGPoint(x: pill.midX - ts.width / 2, y: pill.midY - ts.height / 2))
+            // Credit for GIFs from a search service, bottom-left, as WhatsApp shows it.
+            let credit = ["\"gif\":\"giphy\"": "GIPHY", "\"gif\":\"tenor\"": "Tenor", "\"gif\":\"klipy\"": "KLIPY"]
+                .first { msg.extra.contains($0.key) }?.value
+            if let credit {
+                let c = NSAttributedString(string: credit, attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .heavy), .foregroundColor: NSColor.white.withAlphaComponent(0.85),
+                    .shadow: Self.textShadow])
+                c.draw(at: CGPoint(x: m.minX + 10, y: m.maxY - 22))
+            }
+        } else if msg.kind == .video {
             let d: CGFloat = 44
             let c = CGRect(x: m.midX - d / 2, y: m.midY - d / 2, width: d, height: d)
             NSColor.black.withAlphaComponent(0.4).setFill()

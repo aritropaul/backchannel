@@ -21,30 +21,46 @@ import (
 
 // req is the single command envelope Swift sends through WACall.
 type req struct {
-	Op        string `json:"op"`
-	Chat      string `json:"chat"`
-	ID        string `json:"id"`
-	Text      string `json:"text"`
-	Quote     string `json:"quote"`
-	Emoji     string `json:"emoji"`
-	On        bool   `json:"on"`
-	Hours     int    `json:"hours"`
-	Path      string `json:"path"`
-	Thumb     string `json:"thumb"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	Mime      string `json:"mime"`
-	Active    bool   `json:"active"`
-	Dir       string `json:"dir"`
-	Phone     string `json:"phone"`
-	Seconds   int    `json:"seconds"`
-	Wave      string `json:"waveform"` // base64, 64 bytes
-	LinkURL   string `json:"link_url"`
-	LinkTitle string `json:"link_title"`
-	LinkDesc  string `json:"link_desc"`
-	Name      string `json:"name"`  // file name shown to the recipient
-	Bytes     int    `json:"bytes"` // video_prefix: how much of the file to fetch
-	Value     string `json:"value"` // set_privacy: the setting's new value
+	Op          string       `json:"op"`
+	Chat        string       `json:"chat"`
+	ID          string       `json:"id"`
+	Text        string       `json:"text"`
+	Quote       string       `json:"quote"`
+	Emoji       string       `json:"emoji"`
+	On          bool         `json:"on"`
+	Hours       int          `json:"hours"`
+	Path        string       `json:"path"`
+	Thumb       string       `json:"thumb"`
+	Width       int          `json:"width"`
+	Height      int          `json:"height"`
+	Mime        string       `json:"mime"`
+	Active      bool         `json:"active"`
+	Dir         string       `json:"dir"`
+	Phone       string       `json:"phone"`
+	Seconds     int          `json:"seconds"`
+	Wave        string       `json:"waveform"` // base64, 64 bytes
+	LinkURL     string       `json:"link_url"`
+	LinkTitle   string       `json:"link_title"`
+	LinkDesc    string       `json:"link_desc"`
+	Name        string       `json:"name"`  // file name shown to the recipient
+	Bytes       int          `json:"bytes"` // video_prefix: how much of the file to fetch
+	Value       string       `json:"value"` // set_privacy: the setting's new value
+	JIDs        []string     `json:"jids"`  // create_group: the people to add
+	Label       string       `json:"label"`
+	Options     []string     `json:"options"` // send_poll, vote_poll
+	Multi       bool         `json:"multi"`   // send_poll: allow several answers
+	Desc        string       `json:"desc"`    // send_event
+	Location    string       `json:"location"`
+	Start       int64        `json:"start"` // unix seconds
+	End         int64        `json:"end"`
+	AllowGuests bool         `json:"allow_guests"`
+	Response    string       `json:"response"` // respond_event: going / not_going / maybe
+	Guests      int          `json:"guests"`
+	Contacts    []contactReq `json:"contacts"`   // send_contacts
+	Animated    bool         `json:"animated"`   // send_sticker, sticker_favorite
+	Gif         bool         `json:"gif"`        // send_file: a looping, silent GIF
+	Retry       bool         `json:"retry"`      // download: ask the phone to re-upload expired media
+	GifSource   string       `json:"gif_source"` // send_file: "giphy" or "tenor", credited on the GIF
 }
 
 func call(raw []byte) (out any) {
@@ -133,7 +149,7 @@ func call(raw []byte) (out any) {
 	case "mute":
 		go a.appState(r.Chat, "mute", r.On, r.Hours)
 	case "download":
-		go a.download(r.Chat, r.ID)
+		go a.downloadMedia(r.Chat, r.ID, r.Retry)
 	case "avatar":
 		a.requestAvatar(r.Chat)
 	case "older":
@@ -144,6 +160,46 @@ func call(raw []byte) (out any) {
 		res, err = a.pairPhone(r.Phone)
 	case "repair":
 		a.restartPairing()
+	case "star":
+		err = a.star(r.Chat, r.ID, r.On)
+	case "set_timer":
+		err = a.setTimer(r.Chat, r.Seconds)
+	case "limit_sharing":
+		err = a.setLimitSharing(r.Chat, r.On)
+	case "favorite":
+		err = a.favorite(r.Chat, r.On)
+	case "label_chat":
+		err = a.labelChat(r.Chat, r.Label, r.On)
+	case "clear_chat":
+		err = a.clearChat(r.Chat, r.On)
+	case "clear_media":
+		res, err = a.clearMedia(r.Chat)
+	case "create_group":
+		res, err = a.createGroup(strings.TrimSpace(r.Name), r.JIDs)
+	case "add_to_group":
+		err = a.addToGroup(r.Chat, r.Phone)
+	case "send_contact":
+		res, err = a.sendContacts(r.Chat, []contactReq{{Name: r.Name, Phone: r.Phone}})
+	case "send_contacts":
+		res, err = a.sendContacts(r.Chat, r.Contacts)
+	case "send_poll":
+		res, err = a.sendPoll(r)
+	case "vote_poll":
+		res, err = a.votePoll(r)
+	case "send_event":
+		res, err = a.sendEvent(r)
+	case "respond_event":
+		res, err = a.respondEvent(r)
+	case "cancel_event":
+		res, err = a.cancelEvent(r)
+	case "send_audio":
+		res, err = a.sendAudio(r)
+	case "send_sticker":
+		res, err = a.sendSticker(r)
+	case "sticker_favorite":
+		res, err = a.favoriteSticker(r)
+	case "sticker_fetch":
+		go a.fetchSavedSticker(r.ID)
 	case "logout":
 		go func() {
 			if a.cli != nil {
@@ -267,6 +323,11 @@ func (a *App) localEcho(r *msgRow, chat types.JID) {
 }
 
 func (a *App) deliver(chat types.JID, id string, msg *waE2E.Message) {
+	// In a chat with disappearing messages on, what I send disappears too.
+	var eph int
+	if a.rdb.QueryRow(`SELECT ephemeral FROM chats WHERE jid=?`, chat.String()).Scan(&eph) == nil && eph > 0 {
+		setExpiration(msg, uint32(eph))
+	}
 	_, err := a.cli.SendMessage(a.ctx, chat, msg, whatsmeow.SendRequestExtra{ID: id})
 	st := StSent
 	if err != nil {
@@ -673,7 +734,7 @@ func (a *App) profile(chatS string) (any, error) {
 				"admin": p.IsAdmin || p.IsSuperAdmin, "owner": p.IsSuperAdmin})
 		}
 		out["participants"] = people
-		a.events <- groupSize{j.String(), len(g.Participants)}
+		a.events <- groupSize{j.String(), len(g.Participants), g}
 	} else {
 		if info, err := a.cli.GetUserInfo(a.ctx, []types.JID{j}); err == nil {
 			for _, u := range info {
@@ -791,6 +852,7 @@ func (a *App) sendFile(r req) (any, error) {
 		mime = "application/octet-stream"
 	}
 	video := strings.HasPrefix(mime, "video/") && r.Thumb != ""
+	gif := video && r.Gif
 	var thumb []byte
 	if r.Thumb != "" {
 		thumb, _ = os.ReadFile(r.Thumb)
@@ -804,6 +866,12 @@ func (a *App) sendFile(r req) (any, error) {
 	if video {
 		row.Kind, row.FileName = KVideo, ""
 		row.Width, row.Height, row.Seconds = r.Width, r.Height, r.Seconds
+		if gif {
+			row.FileName = "GIF" // how incoming GIFs are marked too
+			if r.GifSource != "" {
+				row.Extra = jsonString(map[string]string{"gif": r.GifSource})
+			}
+		}
 	}
 	ci := a.quoteContext(chat, r.Quote)
 	if ci != nil {
@@ -835,6 +903,15 @@ func (a *App) sendFile(r req) (any, error) {
 				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
 				Seconds: proto.Uint32(uint32(r.Seconds)), Width: proto.Uint32(uint32(r.Width)), Height: proto.Uint32(uint32(r.Height)),
 				JPEGThumbnail: thumb, ContextInfo: ci,
+			}
+			if gif {
+				v.GifPlayback = proto.Bool(true)
+				switch r.GifSource {
+				case "giphy":
+					v.GifAttribution = waE2E.VideoMessage_GIPHY.Enum()
+				case "tenor":
+					v.GifAttribution = waE2E.VideoMessage_TENOR.Enum()
+				}
 			}
 			msg.VideoMessage = v
 			a.db.Exec(`UPDATE messages SET media=? WHERE chat=? AND id=?`, refFor(v, "video"), chat.String(), id)

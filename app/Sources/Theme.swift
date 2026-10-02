@@ -20,6 +20,7 @@ enum Theme {
     /// The transcript canvas: the system text background, or the chosen wallpaper tone.
     static let canvas = NSColor(name: "canvas") { @Sendable ap in
         let dark = ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        if let c = ChatThemes.canvas(dark: dark) { return c }   // the open chat's own theme
         if let w = Wallpaper.color(dark: dark) { return w }
         var c = NSColor(hex: dark ? 0x1E1E1E : 0xFFFFFF)
         ap.performAsCurrentDrawingAppearance { if let t = NSColor.textBackgroundColor.usingColorSpace(.sRGB) { c = t } }
@@ -29,12 +30,19 @@ enum Theme {
     /// means the app's AccentColor, WhatsApp green). On WhatsApp green it's WhatsApp's exact
     /// pair (pale green / deep green); any other accent gets the same lightness and relative
     /// chroma at the accent's hue, so the ink colors below stay legible.
+    /// A chat theme's bubble colour (ChatThemes) takes the accent's place in that chat.
     static let bubbleOut = NSColor(name: "bubbleOut") { @Sendable ap in
-        OKLCH.bubble(accent: resolvedAccent(ap), dark: ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        OKLCH.bubble(accent: ChatThemes.bubbleAccent() ?? resolvedAccent(ap), dark: ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
     }
     /// Large selected fills (sidebar rows, pinned tiles) wear the bubble tone with bubble ink,
     /// as WhatsApp does for its selected chips; the solid accent is kept for small marks.
-    static var selection: NSColor { bubbleOut }
+    /// Always the app's accent: a chat's own bubble colour stays in that chat.
+    static let selection = NSColor(name: "selection") { @Sendable ap in
+        OKLCH.bubble(accent: resolvedAccent(ap), dark: ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+    }
+    /// Backing for text drawn straight on a picture wallpaper (day separators, names,
+    /// status), the way WhatsApp puts its date chips in pills.
+    static let chip = dynA("chip", 0xFFFFFF, 0.82, 0x1E1E1E, 0.8)
     static var onSelection: NSColor { inkOut }
     static var onSelectionSecondary: NSColor { secondaryOut }
     static let bubbleIn = dyn("bubbleIn", 0xE9E9EB, 0x3B3B3D)
@@ -115,6 +123,53 @@ enum Theme {
         return out
     }
     static var failed: NSColor { .systemRed }
+
+    /// With a wallpaper behind the open chat, the other person's bubbles and the name pill
+    /// are frosted glass (owner's request, 2026-10-02) instead of flat grey.
+    nonisolated static var frostsOverWallpaper: Bool {
+        let w = ChatThemes.current.wallpaper
+        return w == "default" ? Prefs.wallpaper != "none" : w != "none"
+    }
+    /// The thin light edge on frosted glass.
+    static let glassRim = dynA("glassRim", 0x000000, 0.10, 0xFFFFFF, 0.16)
+    /// Darkens (or, in light mode, lightens) the frost inside a bubble so it reads as
+    /// tinted glass over any wallpaper, light or dark.
+    static let glassTint = dynA("glassTint", 0xFFFFFF, 0.35, 0x000000, 0.38)
+
+    /// A pill behind text that sits straight on the canvas, only when the open chat has
+    /// a picture wallpaper (on a flat canvas the text reads fine as is).
+    /// Small text straight on the canvas (Delivered, Read): secondary label colour, or
+    /// on a wallpaper, dark or light by how bright the wallpaper is.
+    static let metaOnCanvas = NSColor(name: "metaOnCanvas") { @Sendable ap in
+        let dark = ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        guard frostsOverWallpaper, let bg = ChatThemes.canvas(dark: dark)?.usingColorSpace(.sRGB) else {
+            return dark ? NSColor(white: 1, alpha: 0.55) : NSColor(white: 0, alpha: 0.5)
+        }
+        let l = 0.2126 * bg.redComponent + 0.7152 * bg.greenComponent + 0.0722 * bg.blueComponent
+        return l > 0.55 ? NSColor(white: 0, alpha: 0.62) : NSColor(white: 1, alpha: 0.82)
+    }
+
+    /// A soft halo for that text over a photo, whose brightness varies under it.
+    static var canvasTextShadow: NSShadow? {
+        guard ChatThemes.current.isPicture else { return nil }
+        let s = NSShadow()
+        s.shadowBlurRadius = 3
+        s.shadowOffset = .zero
+        s.shadowColor = NSColor(name: nil) { ap in
+            let dark = ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let bg = ChatThemes.canvas(dark: dark)?.usingColorSpace(.sRGB)
+            let l = bg.map { 0.2126 * $0.redComponent + 0.7152 * $0.greenComponent + 0.0722 * $0.blueComponent } ?? 0.5
+            return l > 0.55 ? NSColor(white: 1, alpha: 0.6) : NSColor(white: 0, alpha: 0.55)
+        }
+        return s
+    }
+
+    static func drawChip(behind r: CGRect) {
+        guard ChatThemes.current.isPicture else { return }
+        let pill = r.insetBy(dx: -7, dy: -2.5)
+        chip.setFill()
+        NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
+    }
 
     static func ink(fromMe: Bool) -> NSColor { fromMe ? inkOut : inkIn }
     static func secondaryInk(fromMe: Bool) -> NSColor { fromMe ? secondaryOut : .secondaryLabelColor }

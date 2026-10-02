@@ -32,6 +32,8 @@ enum Prefs {
     nonisolated static var autoAudio: Bool { bool("WA.auto.audio", true) }
     nonisolated static var autoVideoPosters: Bool { bool("WA.auto.videoPosters", true) }
     nonisolated static var autoDocuments: Bool { bool("WA.auto.documents", false) }
+    /// Save photos and videos I receive to the Photos library (each chat can override).
+    static var saveToPhotos: Bool { bool("WA.saveToPhotos", false) }
 
     // MARK: Notifications
 

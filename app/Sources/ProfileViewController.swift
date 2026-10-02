@@ -27,6 +27,7 @@ final class HeaderAvatarButton: NSView {
 final class HeaderCapsule: NSView {
     private let glass = NSGlassEffectView()
     private let rim = GlassRim()
+    private let frost = FrostView()
     private let name = NSTextField(labelWithString: "")
     private let sub = NSTextField(labelWithString: "")
     private let chevron = NSImageView()
@@ -40,7 +41,9 @@ final class HeaderCapsule: NSView {
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
         glass.contentView = content
-        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        // Messages' header name is a size up and bolder than a list name (measured against
+        // the owner's Messages screenshot: ~14pt bold); 13pt semibold read as condensed.
+        name.font = .systemFont(ofSize: 14, weight: .bold)
         name.lineBreakMode = .byTruncatingTail
         sub.font = .systemFont(ofSize: 10.5)
         sub.textColor = .secondaryLabelColor
@@ -58,9 +61,18 @@ final class HeaderCapsule: NSView {
         row.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(row)
         rim.radius = 15
-        rim.fill = NSColor.windowBackgroundColor.withAlphaComponent(0.86)   // text over moving content needs a solid read
-        [rim, glass].forEach(addSubview)
+        frost.rounded(15)
+        frost.translatesAutoresizingMaskIntoConstraints = false
+        [frost, rim, glass].forEach(addSubview)
+        updateFrost()
+        NotificationCenter.default.addObserver(forName: Theme.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateFrost() }
+        }
         NSLayoutConstraint.activate([
+            frost.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+            frost.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+            frost.topAnchor.constraint(equalTo: glass.topAnchor),
+            frost.bottomAnchor.constraint(equalTo: glass.bottomAnchor),
             rim.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
             rim.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
             rim.topAnchor.constraint(equalTo: glass.topAnchor),
@@ -80,6 +92,14 @@ final class HeaderCapsule: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Over a wallpaper the pill is frosted glass; otherwise a near-solid backing, since
+    /// text over moving messages needs a steady read.
+    private func updateFrost() {
+        let on = Theme.frostsOverWallpaper
+        frost.isHidden = !on
+        rim.fill = on ? .clear : NSColor.windowBackgroundColor.withAlphaComponent(0.86)
+    }
+
     func set(name n: String, subtitle: String, chevron showChevron: Bool = true) {
         name.stringValue = n
         sub.stringValue = subtitle
@@ -92,11 +112,27 @@ final class HeaderCapsule: NSView {
     override func mouseUp(with event: NSEvent) { onClick?() }
 }
 
-/// Right-hand glass inspector, laid out like Messages' info panel: close button,
-/// big photo and name, action circles, then grouped cards.
+/// Right-hand glass inspector: Messages' layout (big photo and name, action circles)
+/// carrying WhatsApp's contact info (media, starred, notifications, chat theme,
+/// disappearing messages, lock, privacy, groups in common, and the actions at the
+/// bottom). Deeper settings push pages inside the panel.
 final class ProfileViewController: NSViewController {
-    private let store: Store
+    let store: Store
     private(set) var jid: String?
+    var chat: Chat? { jid.flatMap { store.chat($0) } }
+    /// Opens a chat scrolled to a message.
+    var onJump: ((String, String) -> Void)?
+    var onOpenChat: ((String) -> Void)?
+    var onSearchInChat: ((Chat) -> Void)?
+    /// Rebuilds the open Chat theme / Wallpaper pages when an Image Playground picture lands.
+    var themePageBuild: (() -> Void)?
+    var wallpaperPageBuild: (() -> Void)?
+    /// Set while a dev hook pushes a page, so screenshots don't catch it mid-slide.
+    var debugUnanimated = false
+
+    private let root = NSView()
+    private let panelFrost = FrostView()
+    private var pages: [ProfilePage] = []
     private let scroll = NSScrollView()
     private let stack = NSStackView()
     private let avatar = AvatarView(frame: NSRect(x: 0, y: 0, width: 96, height: 96))
@@ -104,10 +140,19 @@ final class ProfileViewController: NSViewController {
     private let subtitle = NSTextField(labelWithString: "")
     private let actions = NSStackView()
     private let infoCard = Card()
+    private let mediaCard = Card()
+    private let settingsCard = Card()
+    private let privacyCard = Card()
+    private let detailsCard = Card()
     private let toggleCard = Card()
     private let photosCard = Card()
     private let membersCard = Card()
+    private let commonCaption = ProfilePage.note("", size: 13, weight: .semibold)
+    private let commonCard = Card()
+    private let moreCard = Card()
+    private let dangerCard = Card()
     private var loadToken = UUID()
+    var blocked: Bool?
 
     init(store: Store) {
         self.store = store
@@ -118,6 +163,12 @@ final class ProfileViewController: NSViewController {
     override func loadView() {
         let v = NSView()
         view = v
+        // Frosted more than the system glass: the transcript under the panel blurs away.
+        panelFrost.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(panelFrost)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.wantsLayer = true
+        v.addSubview(root)
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -132,13 +183,19 @@ final class ProfileViewController: NSViewController {
         subtitle.textColor = .secondaryLabelColor
         subtitle.alignment = .center
         actions.orientation = .horizontal
-        actions.spacing = 14
+        actions.spacing = 10   // five 38pt circles fit the panel's 280pt minimum
+        // Hug the circles: rebuilt after every click, a loose stack stretched to the
+        // panel's width and laid them out from the left.
+        actions.setHuggingPriority(.required, for: .horizontal)
 
-        [avatar, name, subtitle, actions, infoCard, toggleCard, photosCard, membersCard].forEach(stack.addArrangedSubview)
+        let cards = [infoCard, mediaCard, settingsCard, privacyCard, detailsCard, photosCard, toggleCard, membersCard,
+                     commonCaption, commonCard, moreCard, dangerCard]
+        ([avatar, name, subtitle, actions] + cards).forEach(stack.addArrangedSubview)
         stack.setCustomSpacing(10, after: avatar)
         stack.setCustomSpacing(2, after: name)
         stack.setCustomSpacing(16, after: subtitle)
         stack.setCustomSpacing(20, after: actions)
+        stack.setCustomSpacing(6, after: commonCaption)
 
         let doc = FlippedView()
         doc.translatesAutoresizingMaskIntoConstraints = false
@@ -150,12 +207,20 @@ final class ProfileViewController: NSViewController {
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         // The close button is a toolbar item tracking this panel (see MainWindowController).
-        v.addSubview(scroll)
+        root.addSubview(scroll)
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: v.safeAreaLayoutGuide.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+            panelFrost.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            panelFrost.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            panelFrost.topAnchor.constraint(equalTo: v.topAnchor),
+            panelFrost.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+            root.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            root.topAnchor.constraint(equalTo: v.topAnchor),
+            root.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
             stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
@@ -165,27 +230,32 @@ final class ProfileViewController: NSViewController {
             avatar.heightAnchor.constraint(equalToConstant: 96),
             name.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor, constant: -28),
         ])
-        for c in [infoCard, toggleCard, photosCard, membersCard] {
+        for c in cards {
             c.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
         }
+        commonCaption.alignment = .left
+        commonCaption.textColor = .labelColor
     }
 
     func show(_ chatJID: String) {
         guard let c = store.chat(chatJID) else { return }
+        if jid != chatJID { popToRoot(animated: false) }
         jid = chatJID
         let token = UUID()
         loadToken = token
         avatar.configure(jid: c.jid, name: c.name, isGroup: c.isGroup, path: c.avatar, px: 192)
         name.stringValue = c.name
-        subtitle.stringValue = c.isGroup ? "Group" : ""
-        subtitle.isHidden = !c.isGroup
+        subtitle.stringValue = c.isGroup ? "Group" : JID.phone(c.jid)
+        subtitle.isHidden = false
         buildActions(c)
         infoCard.setRows(c.isGroup ? [] : [Card.labeled("mobile", JID.phone(c.jid), selectable: true)])
         infoCard.isHidden = c.isGroup
+        buildSections(c)
         buildToggles(c)
         buildPhotos(c.jid)
         membersCard.setRows([])
         membersCard.isHidden = true
+        if blocked == nil || jid != chatJID { blocked = nil }
         scrollToTop()
         Task { [weak self] in
             let info = await Core.shared.callAsync("profile", ["chat": chatJID])
@@ -193,6 +263,23 @@ final class ProfileViewController: NSViewController {
             self.apply(info, chat: c)
             self.scrollToTop()
         }
+        if !c.isGroup {
+            Task { [weak self] in
+                let list = await Core.shared.callAsync("blocklist", [:])
+                guard let self, self.loadToken == token else { return }
+                let people = list["blocked"] as? [[String: Any]] ?? []
+                self.blocked = people.contains { ($0["jid"] as? String) == chatJID }
+                if let fresh = self.chat { self.buildDanger(fresh) }
+            }
+        }
+    }
+
+    /// Rebuilds the cards after something in them changed (a toggle, a page).
+    func refreshSections() {
+        guard let c = chat else { return }
+        buildActions(c)
+        buildSections(c)
+        buildToggles(c)
     }
 
     private func scrollToTop() {
@@ -214,7 +301,10 @@ final class ProfileViewController: NSViewController {
         var rows: [NSView] = []
         if !c.isGroup { rows.append(Card.labeled("mobile", JID.phone(c.jid), selectable: true)) }
         if let biz = info["business"] as? String, !biz.isEmpty { rows.append(Card.labeled("business", biz)) }
-        if let about = info["about"] as? String, !about.isEmpty { rows.append(Card.labeled("about", about)) }
+        // WhatsApp returns " " for someone without an About.
+        if let about = (info["about"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !about.isEmpty {
+            rows.append(Card.labeled("about", about))
+        }
         if let topic = info["topic"] as? String, !topic.isEmpty { rows.append(Card.labeled("description", topic)) }
         if let created = info["created"] as? Double, created > 0 {
             let f = DateFormatter()
@@ -223,6 +313,7 @@ final class ProfileViewController: NSViewController {
         }
         infoCard.setRows(rows)
         infoCard.isHidden = rows.isEmpty
+        lastInfo = info
         if let people = info["participants"] as? [[String: Any]] {
             subtitle.stringValue = "Group · \(people.count) members"
             let sorted = people.sorted { a, b in
@@ -241,17 +332,28 @@ final class ProfileViewController: NSViewController {
             membersCard.setRows(memberRows, separators: false)
             membersCard.isHidden = false
         }
+        // Group members just landed in the store: groups in common may have changed.
+        if !c.isGroup { buildCommon(c) }
     }
+
+    /// The last profile lookup (about, business), for Contact details.
+    private(set) var lastInfo: [String: Any] = [:]
 
     private func refresh() {
         guard let j = jid else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.show(j) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, let c = self.store.chat(j) else { return }
+            self.buildActions(c)
+            self.buildSections(c)
+            self.buildToggles(c)
+        }
     }
 
     private func buildActions(_ c: Chat) {
         actions.arrangedSubviews.forEach { $0.removeFromSuperview() }
         let jid = c.jid
         let items: [(String, String, () -> Void)] = [
+            ("magnifyingglass", "Search in Chat", { [weak self] in self?.onSearchInChat?(c) }),
             (c.isMuted ? "bell.fill" : "bell.slash.fill", c.isMuted ? "Unmute" : "Mute", {
                 Core.shared.call("mute", ["chat": jid, "on": !c.isMuted, "hours": 0])
             }),
@@ -266,7 +368,7 @@ final class ProfileViewController: NSViewController {
             }),
         ]
         for (sym, tip, act) in items {
-            actions.addArrangedSubview(CircleAction(symbol: sym, tip: tip, size: 46) { [weak self] in
+            actions.addArrangedSubview(CircleAction(symbol: sym, tip: tip, size: 38) { [weak self] in
                 act()
                 self?.refresh()
             })
@@ -319,6 +421,237 @@ final class ProfileViewController: NSViewController {
             for _ in 0..<(3 - items.count % 3) { r.addArrangedSubview(NSView()) }
         }
         photosCard.setRows([Card.caption("PHOTOS"), grid], separators: false)
+    }
+
+    // MARK: WhatsApp's sections
+
+    private func buildSections(_ c: Chat) {
+        let counts = store.mediaCounts(c.jid)
+        let starred = store.starredCount(c.jid)
+        let bytes = store.downloads(c.jid).reduce(Int64(0)) { $0 + Fmt.fileSize($1.path) }
+        mediaCard.setRows([
+            NavRow(symbol: "photo.on.rectangle", title: "Media, links and docs", detail: counts.total > 0 ? counts.total.formatted() : "None") { [weak self] in
+                self?.pushMedia()
+            },
+            NavRow(symbol: "internaldrive", title: "Manage storage", detail: bytes > 0 ? Fmt.bytes(bytes) : "None") { [weak self] in
+                self?.pushStorage()
+            },
+            NavRow(symbol: "star", title: "Starred", detail: starred > 0 ? starred.formatted() : "None") { [weak self] in
+                self?.pushStarred()
+            },
+        ])
+        let save: String = switch ChatPrefs.saveMode(c.jid) {
+        case .default: "Default"
+        case .always: "Always"
+        case .never: "Never"
+        }
+        settingsCard.setRows([
+            NavRow(symbol: "bell", title: "Notifications", detail: c.isMuted ? "Muted" : nil) { [weak self] in self?.pushNotifications() },
+            NavRow(symbol: "paintpalette", title: "Chat theme") { [weak self] in self?.pushTheme() },
+            NavRow(symbol: "square.and.arrow.down", title: "Save to Photos", detail: save) { [weak self] in self?.pushSaveToPhotos() },
+        ])
+        let lock = NSSwitch()
+        lock.state = ChatPrefs.isLocked(c.jid) ? .on : .off
+        lock.controlSize = .small
+        lock.target = self
+        lock.action = #selector(lockFlipped(_:))
+        privacyCard.setRows([
+            NavRow(symbol: "timer", title: "Disappearing messages", detail: Fmt.timer(c.ephemeral)) { [weak self] in self?.pushDisappearing() },
+            NavRow(symbol: "lock.rectangle.on.rectangle", title: "Lock chat", subtitle: "Lock and hide this chat on this Mac.",
+                   chevron: false, trailing: lock) { [weak self] in
+                lock.state = lock.state == .on ? .off : .on
+                self?.lockFlipped(lock)
+            },
+            NavRow(symbol: "checkerboard.shield", title: "Advanced chat privacy", detail: c.limitSharing ? "On" : "Off") { [weak self] in
+                self?.pushAdvancedPrivacy()
+            },
+            NavRow(symbol: "lock", title: "Encryption",
+                   subtitle: "Messages \(c.isGroup ? "in this group are" : "and calls are") end-to-end encrypted.") { [weak self] in
+                self?.pushEncryption()
+            },
+        ])
+        detailsCard.isHidden = c.isGroup
+        if !c.isGroup {
+            detailsCard.setRows([
+                NavRow(symbol: "person.crop.circle", title: "Contact details") { [weak self] in self?.pushContactDetails() },
+            ])
+        }
+        if c.isGroup {
+            commonCaption.isHidden = true
+            commonCard.isHidden = true
+        } else {
+            buildCommon(c)
+        }
+        buildMore(c)
+        buildDanger(c)
+    }
+
+    private func buildCommon(_ c: Chat) {
+        let groups = store.commonGroups(with: c.jid)
+        commonCaption.stringValue = groups.isEmpty ? "No groups in common" : groups.count == 1 ? "1 group in common" : "\(groups.count) groups in common"
+        commonCaption.isHidden = false
+        commonCard.isHidden = false
+        var rows: [NSView] = [
+            NavRow(symbol: "plus.circle", title: "Create group with \(c.name)", chevron: false) { [weak self] in self?.createGroup(with: c) },
+            NavRow(symbol: "person.2.badge.plus", title: "Add to group", chevron: false) { [weak self] in self?.pushAddToGroup() },
+        ]
+        for g in groups.prefix(3) {
+            rows.append(PersonRow(jid: g.jid, name: g.name, subtitle: g.members.joined(separator: ", "), isGroup: true, avatar: g.avatar) { [weak self] in
+                self?.onOpenChat?(g.jid)
+            })
+        }
+        if groups.count > 3 {
+            rows.append(NavRow(symbol: nil, title: "See all") { [weak self] in self?.pushCommonGroups() })
+        }
+        commonCard.setRows(rows)
+    }
+
+    private func buildMore(_ c: Chat) {
+        var rows: [NSView] = []
+        if !c.isGroup {
+            rows.append(actionRow("Share contact", color: Theme.accent) { [weak self] in self?.pushShareContact() })
+        }
+        rows.append(actionRow(c.favorite ? "Remove from Favorites" : "Add to Favorites", color: Theme.accent) { [weak self] in
+            self?.toggleFavorite(c)
+        })
+        rows.append(actionRow("Change list", color: Theme.accent) { [weak self] in self?.pushLists() })
+        rows.append(actionRow("Export chat", color: Theme.accent) { [weak self] in self?.exportChat(c) })
+        rows.append(actionRow("Clear chat", color: .systemRed) { [weak self] in self?.clearChat(c) })
+        moreCard.setRows(rows)
+    }
+
+    func buildDanger(_ c: Chat) {
+        dangerCard.isHidden = c.isGroup
+        guard !c.isGroup else { return }
+        let unblock = blocked == true
+        dangerCard.setRows([
+            actionRow(unblock ? "Unblock \(c.name)" : "Block \(c.name)", color: .systemRed) { [weak self] in
+                self?.toggleBlock(c, block: !unblock)
+            },
+        ])
+    }
+
+    @objc private func lockFlipped(_ sw: NSSwitch) {
+        guard let c = chat else { return }
+        let on = sw.state == .on
+        ChatPrefs.authenticate(on ? "lock this chat" : "unlock this chat") { [weak self] ok in
+            guard ok else {
+                sw.state = on ? .off : .on
+                return
+            }
+            ChatPrefs.setLocked(c.jid, on)
+            self?.refreshSections()
+        }
+    }
+
+    /// Dev hook (`WA_PROFILE_PAGE`): pushes one of the pages, as a click on its row would.
+    func debugPush(_ name: String) {
+        debugUnanimated = true
+        defer { debugUnanimated = false }
+        switch name {
+        case "media": pushMedia()
+        case "storage": pushStorage()
+        case "starred": pushStarred()
+        case "notifications": pushNotifications()
+        case "theme": pushTheme()
+        case "save": pushSaveToPhotos()
+        case "disappearing": pushDisappearing()
+        case "privacy": pushAdvancedPrivacy()
+        case "encryption": pushEncryption()
+        case "details": pushContactDetails()
+        case "groups": pushCommonGroups()
+        case "add": pushAddToGroup()
+        case "share": pushShareContact()
+        case "lists": pushLists()
+        case "refresh": refreshSections()
+        case let m where m.hasPrefix("frost-"):
+            // Dev: try a material for the panel's frost ("frost-hud-0.7").
+            let p = m.split(separator: "-")
+            let mats: [String: NSVisualEffectView.Material] = ["hud": .hudWindow, "popover": .popover, "sidebar": .sidebar,
+                "under": .underWindowBackground, "full": .fullScreenUI, "menu": .menu, "header": .headerView, "window": .windowBackground]
+            panelFrost.lockMaterial(mats[String(p[1])] ?? .hudWindow)
+            panelFrost.alphaValue = p.count > 2 ? CGFloat(Double(p[2]) ?? 1) : 1
+        case "scroll": scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, (scroll.documentView?.frame.height ?? 0) - scroll.contentView.bounds.height)))
+        default: break
+        }
+    }
+
+    // MARK: navigation inside the panel
+
+    /// Pushes a page over the root, sliding in from the trailing edge (and back out the
+    /// same way on pop), so where it went is where it comes back from.
+    func push(_ page: ProfilePage, animated: Bool = true) {
+        page.onBack = { [weak self] in self?.pop() }
+        let below: NSView = pages.last ?? root
+        page.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(page)
+        NSLayoutConstraint.activate([
+            page.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            page.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            page.topAnchor.constraint(equalTo: view.topAnchor),
+            page.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        pages.append(page)
+        view.layoutSubtreeIfNeeded()
+        if animated && !debugUnanimated {
+            slide(page, below: below, forward: true) { below.isHidden = true }
+        } else {
+            below.isHidden = true
+        }
+        view.window?.makeFirstResponder(page)
+    }
+
+    func pop() {
+        guard let page = pages.popLast() else { return }
+        let below: NSView = pages.last ?? root
+        below.isHidden = false
+        if pages.isEmpty { refreshSections() }   // counts and values may have changed on the page
+        slide(page, below: below, forward: false) { page.removeFromSuperview() }
+    }
+
+    func popToRoot(animated: Bool) {
+        guard !pages.isEmpty else { return }
+        pages.forEach { $0.removeFromSuperview() }
+        pages.removeAll()
+        root.isHidden = false
+        root.layer?.removeAllAnimations()
+    }
+
+    private func slide(_ page: NSView, below: NSView, forward: Bool, done: @escaping () -> Void) {
+        let w = view.bounds.width
+        guard let pl = page.layer, let bl = below.layer, !Theme.reduceMotion else {
+            if Theme.reduceMotion { Motion.crossfade(view.layer, duration: 0.15) }
+            done()
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { MainActor.assumeIsolated { done() } }
+        let a = Theme.spring("transform", response: 0.34, damping: 1)
+        a.fromValue = CATransform3DMakeTranslation(forward ? w : 0, 0, 0)
+        a.toValue = CATransform3DMakeTranslation(forward ? 0 : w, 0, 0)
+        a.fillMode = .forwards
+        a.isRemovedOnCompletion = false
+        pl.add(a, forKey: "nav")
+        let b = Theme.spring("transform", response: 0.34, damping: 1)
+        b.fromValue = CATransform3DMakeTranslation(forward ? 0 : -w * 0.3, 0, 0)
+        b.toValue = CATransform3DMakeTranslation(forward ? -w * 0.3 : 0, 0, 0)
+        b.fillMode = .forwards
+        b.isRemovedOnCompletion = false
+        bl.add(b, forKey: "nav")
+        let o = CABasicAnimation(keyPath: "opacity")
+        o.fromValue = forward ? 1 : 0
+        o.toValue = forward ? 0 : 1
+        o.duration = 0.22
+        o.fillMode = .forwards
+        o.isRemovedOnCompletion = false
+        bl.add(o, forKey: "navFade")
+        CATransaction.commit()
+        if !forward {
+            DispatchQueue.main.asyncAfter(deadline: .now() + a.duration) {
+                bl.removeAnimation(forKey: "nav")
+                bl.removeAnimation(forKey: "navFade")
+            }
+        }
     }
 }
 

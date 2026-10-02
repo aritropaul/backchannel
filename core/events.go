@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -24,7 +25,12 @@ func (a *App) loop() {
 func (a *App) handle(evt any) {
 	switch e := evt.(type) {
 	case *events.Message:
-		a.onMessage(e, true)
+		// A message the phone resent on request (recoverMissing) is old news: store it
+		// without notifying or counting it unread. One that fills in a "Waiting for this
+		// message" placeholder is still news.
+		a.onMessage(e, e.UnavailableRequestID == "" || a.isPlaceholder(e.Info.Chat, e.Info.ID))
+	case *events.MediaRetry:
+		a.onMediaRetry(e)
 	case *events.UndecryptableMessage:
 		a.onUndecryptable(e)
 	case *events.HistorySync:
@@ -32,7 +38,7 @@ func (a *App) handle(evt any) {
 	case *events.Receipt:
 		a.onReceipt(e)
 	case groupSize:
-		a.setGroupSize(e.chat, e.n)
+		a.setGroupSize(e.chat, e.n, e.info)
 	case *events.IdentityChange:
 		a.onIdentityChange(e)
 	case *events.ChatPresence:
@@ -83,22 +89,49 @@ func (a *App) handle(evt any) {
 		}
 		a.touchChats()
 	case *events.DeleteChat:
-		chat := a.canon(e.JID).String()
-		a.db.Exec(`DELETE FROM messages WHERE chat=?`, chat)
-		a.db.Exec(`DELETE FROM chats WHERE jid=?`, chat)
-		a.touchReload(chat)
+		a.onDeleteChat(e)
 	case *events.ClearChat:
+		a.onClearChat(e)
+	case *events.Star:
+		chat := a.canon(e.ChatJID).String()
+		a.db.Exec(`UPDATE messages SET starred=? WHERE chat=? AND id=?`, b2i(e.Action.GetStarred()), chat, e.MessageID)
+		a.touchMsg(chat, e.MessageID)
+	case *events.AppState:
+		if len(e.Index) == 1 && e.Index[0] == appstate.IndexFavorites && e.SyncActionValue.GetFavoritesAction() != nil {
+			a.setFavorites(e.SyncActionValue.GetFavoritesAction())
+		}
+		if len(e.Index) > 1 && e.Index[0] == appstate.IndexFavoriteSticker && e.SyncActionValue.GetStickerAction() != nil {
+			a.onFavoriteSticker(e.Index, e.SyncActionValue.GetStickerAction())
+		}
+	case *events.LabelEdit:
+		act := e.Action
+		a.db.Exec(`INSERT INTO labels (id, name, color, type, ord, deleted) VALUES (?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET name=excluded.name, color=excluded.color, type=excluded.type,
+				ord=excluded.ord, deleted=excluded.deleted`,
+			e.LabelID, act.GetName(), act.GetColor(), int(act.GetType()), act.GetOrderIndex(), b2i(act.GetDeleted()))
+		a.touchChats()
+	case *events.LabelAssociationChat:
 		chat := a.canon(e.JID).String()
-		a.db.Exec(`DELETE FROM messages WHERE chat=?`, chat)
-		a.db.Exec(`UPDATE chats SET last_id='' WHERE jid=?`, chat)
-		a.touchReload(chat)
+		if e.Action.GetLabeled() {
+			a.db.Exec(`INSERT OR IGNORE INTO chat_labels (chat, label) VALUES (?,?)`, chat, e.LabelID)
+		} else {
+			a.db.Exec(`DELETE FROM chat_labels WHERE chat=? AND label=?`, chat, e.LabelID)
+		}
+		a.touchChats()
 	case *events.GroupInfo:
 		if e.Name != nil && e.Name.Name != "" {
 			a.db.Exec(`INSERT INTO chats (jid, name, is_group) VALUES (?,?,1) ON CONFLICT(jid) DO UPDATE SET name=excluded.name`,
 				e.JID.String(), e.Name.Name)
 			a.touchChats()
 		}
-		if len(e.Join) > 0 || len(e.Leave) > 0 {
+		if e.Ephemeral != nil {
+			secs := 0
+			if e.Ephemeral.IsEphemeral {
+				secs = int(e.Ephemeral.DisappearingTimer)
+			}
+			a.setChatField(e.JID, "ephemeral", secs)
+		}
+		if len(e.Join) > 0 || len(e.Leave) > 0 || len(e.Promote) > 0 || len(e.Demote) > 0 {
 			// Membership changed: refresh the count that group "Read" depends on.
 			a.groupAsked.Delete(e.JID.String())
 			a.fetchGroupSize(e.JID.String())
@@ -114,6 +147,13 @@ func (a *App) handle(evt any) {
 		a.touchChats()
 	case *events.AppStateSyncComplete:
 		a.importContacts()
+		if e.Recovery {
+			a.log.Infof("app state %s recovered from the phone (v%d)", e.Name, e.Version)
+		}
+	case *events.AppStateSyncError:
+		if errors.Is(e.Error, appstate.ErrMismatchingLTHash) || strings.Contains(e.Error.Error(), "mismatching LTHash") {
+			go a.recoverAppState(e.Name)
+		}
 	case *events.PairSuccess:
 		emit(map[string]any{"t": "state", "s": "syncing", "me": e.ID.ToNonAD().String()})
 	case *events.Connected:
@@ -152,15 +192,26 @@ func (a *App) afterConnect() {
 	if a.synced.Swap(true) {
 		return
 	}
+	go func() {
+		// After the offline queue has landed, so only real gaps are asked for.
+		time.Sleep(15 * time.Second)
+		a.recoverMissing()
+	}()
 	a.importContacts()
 	if groups, err := a.cli.GetJoinedGroups(a.ctx); err == nil {
 		tx, err := a.db.Begin()
 		if err == nil {
 			for _, g := range groups {
 				// Member counts drive group "Read" (read by everyone else).
-				tx.Exec(`INSERT INTO chats (jid, name, is_group, participants) VALUES (?,?,1,?)
-					ON CONFLICT(jid) DO UPDATE SET name=excluded.name, is_group=1, participants=excluded.participants`,
-					g.JID.String(), g.Name, len(g.Participants))
+				eph := 0
+				if g.IsEphemeral {
+					eph = int(g.DisappearingTimer)
+				}
+				tx.Exec(`INSERT INTO chats (jid, name, is_group, participants, ephemeral) VALUES (?,?,1,?,?)
+					ON CONFLICT(jid) DO UPDATE SET name=excluded.name, is_group=1, participants=excluded.participants,
+						ephemeral=excluded.ephemeral`,
+					g.JID.String(), g.Name, len(g.Participants), eph)
+				a.putMembers(tx, g)
 			}
 			tx.Commit()
 		}
@@ -170,6 +221,9 @@ func (a *App) afterConnect() {
 	if a.appActive.Load() {
 		a.cli.SendPresence(a.ctx, types.PresenceAvailable)
 	}
+	a.resyncAppStateOnce()
+	a.resyncStickersOnce()
+	a.refetchStickersOnce()
 }
 
 // ---- messages ----
@@ -209,6 +263,10 @@ func (a *App) onMessage(e *events.Message, live bool) {
 				a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`, nr.Text, r.Chat, target, KRevoked)
 				a.touchMsg(r.Chat, target)
 			}
+		case waE2E.ProtocolMessage_EPHEMERAL_SETTING:
+			a.setChatField(chat, "ephemeral", int(pm.GetEphemeralExpiration()))
+		case waE2E.ProtocolMessage_LIMIT_SHARING:
+			a.setChatField(chat, "limit_sharing", b2i(pm.GetLimitSharing().GetSharingLimited()))
 		}
 		return
 	}
@@ -217,6 +275,18 @@ func (a *App) onMessage(e *events.Message, live bool) {
 		if live && !r.FromMe && rm.GetText() != "" {
 			a.notifyReaction(r, chat, rm.GetKey().GetID(), rm.GetText())
 		}
+		return
+	}
+	if m.GetPollUpdateMessage() != nil {
+		a.onPollVote(e, r)
+		return
+	}
+	if m.GetEncEventResponseMessage() != nil {
+		a.onEventResponse(e, r)
+		return
+	}
+	if m.GetSecretEncryptedMessage() != nil {
+		a.onSecretEdit(e, r)
 		return
 	}
 	if e.IsEdit {
@@ -406,7 +476,7 @@ func (a *App) fetchGroupSize(chat string) {
 			a.log.Warnf("group size %s: %v", chat, err)
 			return
 		}
-		a.events <- groupSize{chat, len(g.Participants)}
+		a.events <- groupSize{chat, len(g.Participants), g}
 	}()
 }
 
@@ -414,9 +484,13 @@ func (a *App) fetchGroupSize(chat string) {
 type groupSize struct {
 	chat string
 	n    int
+	info *types.GroupInfo
 }
 
-func (a *App) setGroupSize(chat string, n int) {
+func (a *App) setGroupSize(chat string, n int, info *types.GroupInfo) {
+	if info != nil {
+		a.putMembers(a.db, info)
+	}
 	if n <= 0 {
 		return
 	}
@@ -523,6 +597,13 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		chat.String(), name, b2i(isGroup), ts*1000, conv.GetUnreadCount(), b2i(conv.GetMarkedAsUnread()),
 		pinned, b2i(conv.GetArchived()), muted)
 
+	if conv.EphemeralExpiration != nil {
+		tx.Exec(`UPDATE chats SET ephemeral=? WHERE jid=?`, conv.GetEphemeralExpiration(), chat.String())
+	}
+	if conv.LimitSharing != nil {
+		tx.Exec(`UPDATE chats SET limit_sharing=? WHERE jid=?`, b2i(conv.GetLimitSharing()), chat.String())
+	}
+
 	msgs := conv.GetMessages() // newest first
 	var thumbs []string        // re-sent photos/videos whose thumbnail is a separate download
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -564,6 +645,7 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		if r.FromMe {
 			r.Status = webStatus(wm.GetStatus())
 		}
+		r.Starred = wm.GetStarred()
 		if err := upsertMessage(tx, r); err != nil {
 			continue
 		}
@@ -583,6 +665,7 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		if len(wm.GetReactions()) > 0 {
 			refreshReactions(tx, r.Chat, r.ID, a.me().String())
 		}
+		a.importInteractions(tx, r, wm.GetPollUpdates(), wm.GetEventResponses())
 		bumpChat(tx, r.Chat, isGroup, r.TS, r.ID)
 	}
 	if err := tx.Commit(); err != nil {

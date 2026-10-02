@@ -4,6 +4,7 @@ import Foundation
 enum MessageKind: Int, Sendable {
     case text, image, video, audio, voice, document, sticker, location, contact, poll, revoked, unsupported, pending
     case notice   // a system line, e.g. "security code changed"
+    case event
 
     var isVisual: Bool { self == .image || self == .video || self == .sticker }
 
@@ -18,6 +19,7 @@ enum MessageKind: Int, Sendable {
         case .location: "Location"
         case .contact: "Contact"
         case .poll: "Poll"
+        case .event: "Event"
         case .revoked: "This message was deleted"
         case .pending: "Waiting for this message"
         case .text, .unsupported, .notice: ""
@@ -35,6 +37,7 @@ enum MessageKind: Int, Sendable {
         case .location: "mappin.and.ellipse"
         case .contact: "person.crop.circle"
         case .poll: "chart.bar.fill"
+        case .event: "calendar"
         case .revoked: "nosign"
         case .pending: "clock"
         default: nil
@@ -68,6 +71,11 @@ struct Chat: Sendable, Equatable {
     let mutedUntil: Int64
     let avatar: String
     let last: Last?
+    /// Disappearing-message timer in seconds (0 = off).
+    var ephemeral = 0
+    /// "Advanced chat privacy".
+    var limitSharing = false
+    var favorite = false
 
     var isMuted: Bool { mutedUntil == -1 || mutedUntil > Int64(Date().timeIntervalSince1970) }
     var hasUnread: Bool { unread > 0 || markedUnread }
@@ -118,11 +126,28 @@ struct Message: Sendable, Equatable {
     let linkURL: String
     let linkTitle: String
     let linkDesc: String
+    var starred = false
+    /// Kind-specific JSON from the core: poll options, event details, contact cards.
+    var extra = ""
+    /// Poll votes or event responses, one per person.
+    var votes: [Vote] = []
 
     var hasLinkPreview: Bool { kind == .text && !linkTitle.isEmpty }
 
     var date: Date { Date(timeIntervalSince1970: TimeInterval(ts) / 1000) }
     var isQuoteFromMe: Bool { !quoteSender.isEmpty && quoteSender == Core.shared.me }
+}
+
+/// One person's current poll vote or event response.
+struct Vote: Sendable, Equatable {
+    let voter: String
+    let name: String
+    /// Polls: the options picked. Events: going / not_going / maybe.
+    let options: [String]
+    let response: String
+    let guests: Int
+    let ts: Int64
+    var isMine: Bool { voter == Core.shared.me }
 }
 
 enum JID {

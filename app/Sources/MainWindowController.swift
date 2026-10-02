@@ -4,7 +4,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
     let store: Store
     let list: ChatListViewController
     let convo: ConversationViewController
-    private let split = NSSplitViewController()
+    private let split = MainSplitViewController()
     private var pairing: PairingViewController?
     private var connectionNote: String?
     private var syncNote: String?
@@ -13,6 +13,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
     private static let composeID = NSToolbarItem.Identifier("compose")
     private static let headerID = NSToolbarItem.Identifier("header")
     private static let closeProfileID = NSToolbarItem.Identifier("closeProfile")
+    private static let contentMinWidth: CGFloat = 320
     private var composeItem: NSToolbarItem?
     private let headerAvatar = HeaderAvatarButton()
     private var profile: ProfileViewController!
@@ -27,7 +28,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
                               backing: .buffered, defer: false)
         window.title = "WA"
         window.titleVisibility = .hidden   // the conversation header replaces the title
-        window.minSize = NSSize(width: 760, height: 480)
+        // The sidebar folds to the compact column, so the window can get as narrow as Messages'.
+        window.minSize = NSSize(width: MainSplitViewController.compactPosition + Self.contentMinWidth, height: 480)
         window.toolbarStyle = .unified
         window.titlebarSeparatorStyle = .automatic
         window.isReleasedWhenClosed = false
@@ -36,12 +38,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         window.delegate = self
 
         let side = NSSplitViewItem(sidebarWithViewController: list)
-        side.minimumThickness = 280
+        // Never closes: narrower than the full list, it snaps to the compact avatar column.
+        side.minimumThickness = ChatListViewController.compactWidth
         side.maximumThickness = 440
-        side.canCollapse = true
+        side.canCollapse = false
         side.preferredThicknessFraction = 0.3
         let content = NSSplitViewItem(viewController: convo)
-        content.minimumThickness = 360
+        content.minimumThickness = Self.contentMinWidth
         // Let the transcript canvas run under the floating glass sidebar.
         content.automaticallyAdjustsSafeAreaInsets = true
         profile = ProfileViewController(store: store)
@@ -68,6 +71,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             }
         }
         convo.onProfile = { [weak self] in self?.toggleProfile(nil) }
+        profile.onJump = { [weak self] chat, id in
+            guard let self else { return }
+            if self.convo.chat?.jid != chat { self.list.select(jid: chat) }
+            self.convo.jump(to: id)
+        }
+        profile.onOpenChat = { [weak self] jid in self?.list.select(jid: jid) }
+        convo.onOpenChat = { [weak self] jid in self?.list.select(jid: jid) }
+        // The viewer covers the chat; the header avatar floats above it in the toolbar.
+        convo.onViewer = { [weak self] open in
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                self?.headerAvatar.animator().alphaValue = open ? 0 : 1
+            }
+        }
+        profile.onSearchInChat = { [weak self] c in
+            guard let self else { return }
+            if self.list.compact { self.toggleCompactSidebar(nil) }
+            self.list.searchIn(c)
+        }
         headerAvatar.onClick = { [weak self] in self?.toggleProfile(nil) }
         headerAvatar.isHidden = true
         // The name capsule tucks under the avatar, so its top edge sits in the toolbar band
@@ -118,7 +140,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         if let frame { window?.setFrame(frame, display: true) }
         list.reload()
         let env = ProcessInfo.processInfo.environment["WA_OPEN_CHAT"]
-        if let last = env ?? UserDefaults.standard.string(forKey: "WA.lastChat"), store.chat(last) != nil {
+        if let last = env ?? UserDefaults.standard.string(forKey: "WA.lastChat"), store.chat(last) != nil,
+           env != nil || !ChatPrefs.isLocked(last) {
             list.select(jid: last)
         }
     }
@@ -190,7 +213,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             syncNote = p < 100 && p > 0 ? "Syncing history… \(p)%" : nil
             updateStatus()
         case .media(let chat, let id, let status):
-            if chat == convo.chat?.jid { convo.mediaFailed(id: id, status: status) }
+            if status == "downloaded" {
+                NotificationCenter.default.post(name: MediaThumb.downloaded, object: nil, userInfo: ["chat": chat, "id": id])
+            } else if chat == convo.chat?.jid {
+                convo.mediaFailed(id: id, status: status)
+            }
         case .notify, .error:
             break
         }
@@ -222,7 +249,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
     // MARK: toolbar
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, .sidebarTrackingSeparator, Self.composeID, .flexibleSpace, Self.headerID, .flexibleSpace, Self.chatMenuID]
+        [.sidebarTrackingSeparator, Self.composeID, .flexibleSpace, Self.headerID, .flexibleSpace, Self.chatMenuID]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -296,6 +323,49 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         for i in ChatListViewController.actions(for: c) { menu.addItem(i) }
     }
 
+    /// Dev hook: opens the profile panel and pushes a page inside it.
+    func debugProfilePage(_ name: String) {
+        if profileItem.isCollapsed { toggleProfile(nil) }
+        // "a,b,c": one page every 3 s, popping back to the panel's root in between.
+        for (i, page) in name.split(separator: ",").enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8 + Double(i) * 3) { [weak self] in
+                self?.profile.popToRoot(animated: false)
+                self?.profile.debugPush(String(page))
+            }
+        }
+    }
+
+    // MARK: sidebar
+
+    /// Divider position before ⌃⌘S folded the sidebar to the compact column.
+    private var fullSidebarPosition: CGFloat = 0
+
+    private var sidebarPosition: CGFloat { split.splitView.arrangedSubviews.first?.frame.maxX ?? 0 }
+
+    /// ⌃⌘S: fold the sidebar to the compact column or open it back out. Keyboard-driven,
+    /// so it snaps without animating (DESIGN.md).
+    @objc func toggleCompactSidebar(_ sender: Any?) {
+        guard isShowingMain else { return }
+        if list.compact {
+            split.splitView.setPosition(max(fullSidebarPosition, MainSplitViewController.fullMinPosition), ofDividerAt: 0)
+        } else {
+            fullSidebarPosition = sidebarPosition
+            split.splitView.setPosition(MainSplitViewController.compactPosition, ofDividerAt: 0)
+        }
+    }
+
+    /// Narrowing the window squeezes the sidebar once the conversation is at its minimum.
+    /// When the resize ends, a sidebar caught between the two layouts settles on one:
+    /// the full list if the window still has room for it, otherwise the compact column.
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard isShowingMain else { return }
+        let p = sidebarPosition
+        let lo = MainSplitViewController.compactPosition, hi = MainSplitViewController.fullMinPosition
+        guard p > lo + 0.5, p < hi - 0.5 else { return }
+        let room = split.splitView.bounds.width - Self.contentMinWidth - (profileItem.isCollapsed ? 0 : profileItem.minimumThickness)
+        split.splitView.setPosition(room >= hi ? MainSplitViewController.snap(p) : lo, ofDividerAt: 0)
+    }
+
     // MARK: new message
 
     private var composePopover: NSPopover?
@@ -344,6 +414,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         if let c = convo.chat, let fresh = store.chat(c.jid), fresh.hasUnread, NSApp.isActive {
             Core.shared.call("mark_read", ["chat": c.jid])
         }
+    }
+}
+
+/// The sidebar never closes, as in Messages. Dragged narrower than the full list it
+/// snaps to the compact avatar column, and back out once dragged past halfway.
+final class MainSplitViewController: NSSplitViewController {
+    // NSSplitViewController declares this but doesn't implement it, so there's no super to call.
+    override func splitView(_ splitView: NSSplitView, constrainSplitPosition proposed: CGFloat, ofSubviewAt index: Int) -> CGFloat {
+        index == 0 ? Self.snap(proposed) : proposed
+    }
+
+    /// The floating glass sidebar sits 8pt in from the window edge, so the divider's
+    /// position is the sidebar's thickness + 8 (measured: setPosition(94) arrives as 102).
+    static let sidebarInset: CGFloat = 8
+    static var compactPosition: CGFloat { ChatListViewController.compactWidth + sidebarInset }
+    static var fullMinPosition: CGFloat { ChatListViewController.fullMinWidth + sidebarInset }
+
+    /// Divider positions between the compact column and the full list's minimum go to
+    /// whichever is nearer.
+    static func snap(_ p: CGFloat) -> CGFloat {
+        let lo = compactPosition, hi = fullMinPosition
+        guard p > lo, p < hi else { return p }
+        return p < (lo + hi) / 2 ? lo : hi
     }
 }
 

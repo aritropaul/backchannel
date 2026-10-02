@@ -318,6 +318,10 @@ import UserNotifications
                 Form.toggle("Documents", on: Prefs.autoDocuments) { on in Prefs.set("WA.auto.documents", on) },
             ], header: "Media auto-download", footer: "Downloads start when the message comes on screen."),
             Form.group([
+                Form.toggle("Save to Photos", detail: "Photos and videos you receive are added to your Photos library. Each chat can override this in its info.",
+                            on: Prefs.saveToPhotos) { on in Prefs.set("WA.saveToPhotos", on) },
+            ]),
+            Form.group([
                 Form.button("Archive all chats", detail: "Moves every chat to Archived, on all your devices.", label: "Archive All…") { [self] in
                     confirm("Archive all chats?", "Every chat moves to Archived on all your devices. New messages bring a chat back.", "Archive All") {
                         run("archive_all", [:])

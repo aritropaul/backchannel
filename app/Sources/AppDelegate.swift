@@ -54,6 +54,244 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFirstHit() }
             }
         }
+        if let w = env["WA_SIDEBAR_WIDTH"].flatMap(Double.init) {
+            // Dev hook: drags the sidebar divider to `w` through the same snapping a drag uses.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak main] in
+                guard let main else { return }
+                let snapped = MainSplitViewController.snap(CGFloat(w))
+                NSLog("WA sidebar: proposed %.0f -> %.0f", w, snapped)
+                (main.contentViewController as? NSSplitViewController)?.splitView.setPosition(snapped, ofDividerAt: 0)
+            }
+        }
+        if env["WA_PULL"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak main] in main?.list.revealArchive() }
+        }
+        if let steps = env["WA_SCROLL_TEST"] {
+            // Dev: scrolls the transcript up by each amount (pt), 2 s apart, as a trackpad would.
+            for (i, dy) in steps.split(separator: ",").compactMap({ Double($0) }).enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5 + Double(i) * 2) { [weak main] in
+                    guard let sv = main?.convo.tableView.enclosingScrollView else { return }
+                    let clip = sv.contentView
+                    clip.scroll(to: NSPoint(x: 0, y: max(-sv.contentInsets.top, clip.bounds.minY - CGFloat(dy))))
+                    sv.reflectScrolledClipView(clip)
+                }
+            }
+        }
+        if env["WA_ATTACH_MENU"] != nil {
+            // Dev: opens the + menu, then closes it 4 s later.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in
+                guard let c = main?.convo else { return }
+                let t = Timer(timeInterval: 4, repeats: false) { _ in
+                    MainActor.assumeIsolated { ConversationViewController.openAttachMenu?.cancelTracking() }
+                }
+                RunLoop.main.add(t, forMode: .common)
+                c.showAttachMenu(from: c.composer.attachAnchor)
+            }
+        }
+        if let which = env["WA_SHEET"] {
+            // Dev: poll, event, contacts or sticker:<image>; shown for 5 s.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in
+                guard let c = main?.convo else { return }
+                switch which {
+                case "poll": c.newPoll()
+                case "event": c.newEvent()
+                case "contacts": c.pickContacts()
+                default:
+                    if which.hasPrefix("sticker:") {
+                        c.presentAsSheet(StickerMakerViewController(source: URL(fileURLWithPath: String(which.dropFirst(8)))))
+                    }
+                }
+                if let out = env["WA_SHEET_OUT"] {
+                    // Sheets on another Space can't be screen-captured; draw the view instead.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak c] in
+                        guard let v = c?.presentedViewControllers?.first?.view,
+                              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                        v.cacheDisplay(in: v.bounds, to: rep)
+                        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak c] in
+                    c?.presentedViewControllers?.forEach { c?.dismiss($0) }
+                }
+            }
+        }
+        if env["WA_VIEWER"] != nil {
+            // Dev: opens the newest photo in the open chat, then presses Space 4 s later.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in
+                guard let c = main?.convo, let jid = c.chat?.jid,
+                      let m = c.store.mediaItems(jid, limit: 50).first(where: { $0.kind == .image && !$0.mediaPath.isEmpty })
+                else { return }
+                c.jump(to: m.id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak c] in
+                    c?.showViewer(m)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak c] in
+                        guard let w = c?.view.window, let e = NSEvent.keyEvent(
+                            with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                            windowNumber: w.windowNumber, context: nil, characters: " ", charactersIgnoringModifiers: " ",
+                            isARepeat: false, keyCode: 49) else { return }
+                        w.sendEvent(e)
+                    }
+                }
+            }
+        }
+        if env["WA_FAV_TEST"] != nil {
+            let store = main.convo.store
+            // Dev: stars the newest downloaded sticker on this Mac, and un-stars it 10 s later.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                guard let s = store.recentStickers().first(where: { !$0.path.isEmpty }) else { return }
+                ConversationViewController.setFavorite(s, true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { ConversationViewController.setFavorite(s, false) }
+            }
+        }
+        if let out = env["WA_STICKER_CARD"] {
+            let store = main.convo.store
+            // Dev: draws the card a sticker click opens, for the newest downloaded sticker.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                guard let s = store.recentStickers().first(where: { !$0.path.isEmpty }) else { return }
+                let card = StickerCardViewController(item: s, favorite: false)
+                let v = card.view
+                v.frame.size = v.fittingSize
+                v.layoutSubtreeIfNeeded()
+                guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                v.cacheDisplay(in: v.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+            }
+        }
+        if env["WA_CLICK_STICKER"] != nil {
+            // Dev: scrolls to the newest downloaded sticker in the open chat and clicks it
+            // with real mouse events, then reports what's on screen.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in
+                guard let c = main?.convo, let jid = c.chat?.jid,
+                      let sid = env["WA_CLICK_STICKER"], let s = c.store.message(chat: jid, id: sid) else {
+                    NSLog("WA click: no sticker"); return
+                }
+                c.jump(to: s.id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak c] in
+                    guard let c, let w = c.view.window, let row = c.rowIndex(of: s.id),
+                          let cell = c.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView,
+                          let r = cell.item?.mediaRect else { NSLog("WA click: sticker not on screen"); return }
+                    let p = cell.convert(CGPoint(x: r.midX, y: r.midY), to: nil)
+                    NSLog("WA click: sticker %@ at %@ hit=%@", s.id, NSStringFromPoint(p), String(describing: w.contentView?.superview?.hitTest(p)))
+                    // Straight to the bubble: a window that isn't active swallows a first click.
+                    if let e = NSEvent.mouseEvent(with: .leftMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                  windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                        cell.mouseDown(with: e)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        for win in NSApp.windows where win.isVisible { NSLog("WA click: window %@ %@", win.className, NSStringFromRect(win.frame)) }
+                        // Draws the card (a popover on another Space can't be screen-captured).
+                        if let out = env["WA_CARD_OUT"], let v = StickerCardViewController.shown?.view.window?.contentView,
+                           let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                            v.cacheDisplay(in: v.bounds, to: rep)
+                            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+                        }
+                    }
+                }
+            }
+        }
+        if env["WA_CLICK_EMOJI"] != nil {
+            // Dev: clicks ☺ through its real target/action, then reports what's on screen.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in
+                guard let b = main?.convo.expressionAnchor as? NSButton else { NSLog("WA click: no button"); return }
+                NSLog("WA click: target=%@ action=%@ enabled=%d window=%@", String(describing: b.target), String(describing: b.action),
+                      b.isEnabled ? 1 : 0, String(describing: b.window))
+                b.performClick(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    for w in NSApp.windows where w.isVisible { NSLog("WA click: window %@ %@", w.className, NSStringFromRect(w.frame)) }
+                }
+            }
+        }
+        if let spec = env["WA_PANEL"] {
+            // Dev: "<gif|stickers>[:<tab>]|<out.png>": opens the ☺ panel and draws it 3 s later.
+            let p = spec.split(separator: "|").map(String.init)
+            let mode = p[0].split(separator: ":").map(String.init)
+            UserDefaults.standard.set(["emoji": 0, "gif": 1][mode[0]] ?? 2, forKey: "WA.expressionMode")
+            func open(_ tries: Int) {
+                guard let c = main.convo as ConversationViewController?, tries > 0 else { return }
+                guard c.chat != nil, c.view.window?.isVisible == true else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { open(tries - 1) }
+                    return
+                }
+                show(c)
+            }
+            func show(_ c: ConversationViewController) {
+                guard let panel = c.showExpressions(from: c.expressionAnchor) else { return }
+                if mode.count > 1, let t = Int(mode[1]) { panel.debugTab(t) }
+                if mode[0] == "gif", let q = env["WA_GIF_SEARCH"] { panel.debugGIFSearch(q) }
+                if mode[0] == "emoji", env["WA_EMOJI_INSERT"] != nil {
+                    // Inserting goes through the same path as a click (it lands in the draft).
+                    c.composer.insertEmoji("😀")
+                    NSLog("WA emoji: composer text now %@", c.composer.text)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    let v = panel.view
+                    NSLog("WA panel hook: bounds %@ parts %d", NSStringFromRect(v.bounds), p.count)
+                    guard p.count > 1, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { NSLog("WA panel hook: no rep"); return }
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    do {
+                        try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: p[1]))
+                    } catch { NSLog("WA panel hook: %@", String(describing: error)) }
+                    panel.dismiss(nil)
+                    panel.view.window?.close()
+                }
+            }
+            // The chat opens a moment after launch; wait for it (up to 15 s).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { open(30) }
+        }
+        if let id = env["WA_JUMP"] {
+            // Dev: scrolls the open chat to a message.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in main?.convo.jump(to: id) }
+        }
+        if let out = env["WA_CARDS"] {
+            // Dev: sample poll, event and contact bubbles drawn to <out>-light/-dark.png.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { DevCards.render(to: out) }
+        }
+        if let out = env["WA_MENU_PREVIEW"] {
+            for dark in [false, true] {
+                let img = ConversationViewController.attachMenuPreview(dark: dark)
+                if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+                   let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: out + (dark ? "-dark.png" : "-light.png")))
+                }
+            }
+        }
+        if let spec = env["WA_STICKER_TEST"] {
+            // Dev: "<image>|<out.png>": renders a sticker (cutout, outline, text) to a file.
+            let p = spec.split(separator: "|").map(String.init)
+            if p.count == 2 {
+                Task { @MainActor in
+                    let (img, cut) = await StickerMakerViewController.load(URL(fileURLWithPath: p[0]))
+                    guard let base = cut ?? img, let out = StickerMakerViewController.render(base, outline: true, text: "hello"),
+                          let d = CGImageDestinationCreateWithURL(URL(fileURLWithPath: p[1]) as CFURL, "public.png" as CFString, 1, nil)
+                    else { return }
+                    CGImageDestinationAddImage(d, out, nil)
+                    CGImageDestinationFinalize(d)
+                }
+            }
+        }
+        if let spec = env["WA_SEARCH_IN"] {
+            // "<chat jid>|<query>": the contact panel's Search, then typing the query.
+            let p = spec.split(separator: "|", maxSplits: 1).map(String.init)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak main] in
+                guard let main, let c = main.store.chat(p[0]) else { return }
+                main.list.searchIn(c)
+                if p.count > 1 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { main.list.setSearch(p[1]) }
+                }
+            }
+        }
+        if let page = env["WA_PROFILE_PAGE"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak main] in main?.debugProfilePage(page) }
+        }
+        if let spec = env["WA_THEME_TRY"] {
+            // "<wallpaper>:<bubble>[:<photo file>]", shown on the open chat without saving.
+            let p = spec.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            let t = ChatTheme(wallpaper: p[0], photo: p.count > 2 ? p[2] : "", bubble: p.count > 1 ? p[1] : "")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { ChatThemes.preview(t) }
+        }
+        if env["WA_SHOW_ARCHIVE"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak main] in main?.list.showArchive(true) }
+        }
         if let f = env["WA_FILTER"].flatMap(Int.init) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFilter(f) }
         }
@@ -130,8 +368,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         switch e {
         case .chats, .reload:
             scheduleBadge()
-        case .notify(let chat, _, let title, let body, let muted, let reaction):
+        case .notify(let chat, let id, let title, let body, let muted, let reaction):
+            if !reaction { PhotoSaver.shared.incoming(chat: chat, id: id) }
             notify(chat: chat, title: title, body: body, muted: muted, reaction: reaction)
+        case .media(let chat, let id, let status) where status == "downloaded":
+            PhotoSaver.shared.downloaded(chat: chat, id: id)
         case .state(let s, _, _):
             if s == "syncing" { requestNotifications() }
             if s == "connected" { focusChanged() }
@@ -165,11 +406,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard group ? Prefs.notifyGroups : Prefs.notifyMessages else { return }
         if reaction, !(group ? Prefs.notifyGroupReactions : Prefs.notifyReactions) { return }
         let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = Prefs.notifyPreviews ? body : "New message"
-        content.threadIdentifier = chat
-        content.userInfo = ["chat": chat]
-        switch Prefs.notifySound {
+        // A locked chat never shows who or what, only that something arrived.
+        let locked = ChatPrefs.isLocked(chat)
+        content.title = locked ? "WA" : title
+        content.body = Prefs.notifyPreviews && !locked ? body : "New message"
+        content.threadIdentifier = locked ? "locked" : chat
+        content.userInfo = ["chat": locked ? "" : chat]
+        let chatSound = ChatPrefs.sound(chat)
+        switch chatSound.isEmpty ? Prefs.notifySound : chatSound {
         case "default": content.sound = .default
         case "none": content.sound = nil
         case let name:
@@ -210,6 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc func showArchived(_ sender: Any?) { wc?.list.showArchive(true) }
     @objc func showChats(_ sender: Any?) { wc?.list.showArchive(false) }
     @objc func goToChat(_ sender: NSMenuItem) { wc?.list.selectNth(sender.tag) }
+    @objc func toggleCompactSidebar(_ sender: Any?) { wc?.toggleCompactSidebar(sender) }
     @objc func focusComposer(_ sender: Any?) { wc?.convo.composer.focus() }
 
     private var current: Chat? { wc?.convo.chat.flatMap { store?.chat($0.jid) } }
@@ -320,7 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             item("Archived Chats", #selector(showArchived(_:)), "a", [.command, .shift], target: self),
         ])
         _ = menu("View", [
-            item("Toggle Sidebar", #selector(NSSplitViewController.toggleSidebar(_:)), "s", [.command, .control]),
+            item("Compact Sidebar", #selector(toggleCompactSidebar(_:)), "s", [.command, .control], target: self),
             item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]),
         ])
         let window = menu("Window", [

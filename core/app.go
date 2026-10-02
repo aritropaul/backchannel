@@ -68,6 +68,7 @@ type App struct {
 	avatarQ         chan string
 	avatarSeen      sync.Map
 	media           sync.Map // in-flight downloads
+	retried         sync.Map // media re-upload requests sent this run
 	olderAsked      sync.Map // chat -> time of last on-demand history request
 	groupAsked      sync.Map // group -> time of last member-count lookup
 	backfilled      sync.Map // chat -> struct{}: missing previews/waveforms already re-requested
@@ -156,6 +157,9 @@ func (a *App) connect() {
 		return
 	}
 	cli := whatsmeow.NewClient(dev, a.log.Sub("client"))
+	// Full app-state syncs (pairing, recovery, resyncAppStateOnce) are where stars,
+	// favorites and lists come from; without this whatsmeow applies them silently.
+	cli.EmitAppStateEventsOnFullSync = true
 	cli.AddEventHandler(func(evt any) {
 		// Deep buffer, then real backpressure: if we ever fall behind, whatsmeow
 		// slows down instead of us parking unbounded events (and their protos)
@@ -370,6 +374,9 @@ type fileLogger struct {
 }
 
 func newLogger(path string) waLog.Logger {
+	// Keep the previous run's log as core.log.1: when something goes wrong and the
+	// app gets relaunched, the evidence is in the run before.
+	os.Rename(path, path+".1")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return waLog.Noop

@@ -3,7 +3,9 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 )
 
 // Message kinds. Mirrored in Swift (MessageKind).
@@ -22,6 +24,7 @@ const (
 	KUnsupported
 	KPending // undecryptable, waiting for retry
 	KNotice  // a system line in the chat, e.g. "security code changed"
+	KEvent
 )
 
 // Outgoing status. Mirrored in Swift (MessageStatus).
@@ -34,7 +37,7 @@ const (
 	StPlayed    = 4
 )
 
-const schemaVersion = 3
+const schemaVersion = 5
 
 // The UI reads this database directly (read-only), so the schema is the API.
 // Keep column names stable; bump schemaVersion for breaking changes.
@@ -52,7 +55,10 @@ CREATE TABLE IF NOT EXISTS chats (
 	muted_until   INTEGER NOT NULL DEFAULT 0,
 	avatar        TEXT    NOT NULL DEFAULT '',
 	avatar_ts     INTEGER NOT NULL DEFAULT 0,
-	participants  INTEGER NOT NULL DEFAULT 0
+	participants  INTEGER NOT NULL DEFAULT 0,
+	ephemeral     INTEGER NOT NULL DEFAULT 0, -- disappearing-message timer, seconds
+	limit_sharing INTEGER NOT NULL DEFAULT 0, -- "Advanced chat privacy"
+	favorite      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chats_order ON chats(archived, pinned DESC, last_ts DESC);
 
@@ -85,6 +91,8 @@ CREATE TABLE IF NOT EXISTS messages (
 	link_url     TEXT    NOT NULL DEFAULT '',
 	link_title   TEXT    NOT NULL DEFAULT '',
 	link_desc    TEXT    NOT NULL DEFAULT '',
+	starred      INTEGER NOT NULL DEFAULT 0,
+	extra        TEXT    NOT NULL DEFAULT '', -- JSON: poll options, event details, contact cards
 	UNIQUE (chat, id)
 );
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(chat, ts);
@@ -126,6 +134,60 @@ CREATE TABLE IF NOT EXISTS receipts (
 	PRIMARY KEY (chat, msg_id, participant)
 ) WITHOUT ROWID;
 
+-- Group membership, for "groups in common" and "Add to group" (admin).
+CREATE TABLE IF NOT EXISTS members (
+	chat  TEXT    NOT NULL,
+	jid   TEXT    NOT NULL,
+	admin INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat, jid)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS members_jid ON members(jid);
+
+-- WhatsApp's chat lists (labels), and which chats are in each.
+CREATE TABLE IF NOT EXISTS labels (
+	id      TEXT    PRIMARY KEY,
+	name    TEXT    NOT NULL DEFAULT '',
+	color   INTEGER NOT NULL DEFAULT 0,
+	type    INTEGER NOT NULL DEFAULT 0,
+	ord     INTEGER NOT NULL DEFAULT 0,
+	deleted INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS chat_labels (
+	chat  TEXT NOT NULL,
+	label TEXT NOT NULL,
+	PRIMARY KEY (chat, label)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS messages_starred ON messages(chat, ts) WHERE starred = 1;
+
+-- Saved stickers (Favorites from the phone or this Mac, and ones made here), kept as
+-- files in WA/stickers and keyed by the SHA-256 of their bytes.
+CREATE TABLE IF NOT EXISTS stickers (
+	hash     TEXT    PRIMARY KEY,
+	path     TEXT    NOT NULL DEFAULT '',
+	mime     TEXT    NOT NULL DEFAULT 'image/webp',
+	width    INTEGER NOT NULL DEFAULT 0,
+	height   INTEGER NOT NULL DEFAULT 0,
+	animated INTEGER NOT NULL DEFAULT 0,
+	favorite INTEGER NOT NULL DEFAULT 0,
+	created  INTEGER NOT NULL DEFAULT 0, -- made on this Mac
+	wa_key   TEXT    NOT NULL DEFAULT '', -- the phone's favoriteSticker index
+	ts       INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- Poll votes and event responses, one row per person: each new one replaces
+-- the last. Polls: choice is a JSON array of option names ([] = retracted).
+-- Events: choice is going / not_going / maybe, with guests they bring.
+CREATE TABLE IF NOT EXISTS votes (
+	chat   TEXT    NOT NULL,
+	msg_id TEXT    NOT NULL,
+	voter  TEXT    NOT NULL,
+	choice TEXT    NOT NULL DEFAULT '',
+	guests INTEGER NOT NULL DEFAULT 0,
+	ts     INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat, msg_id, voter)
+) WITHOUT ROWID;
+
 -- Full-text index over message text and file names, kept in step by triggers.
 -- chat/id are stored so results join back without relying on rowid stability.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -148,7 +210,8 @@ END;
 `
 
 // Every table the app owns, for drops and wipes.
-var appTables = []string{"chats", "messages", "reactions", "contacts", "avatars", "kv", "receipts", "messages_fts"}
+var appTables = []string{"chats", "messages", "reactions", "contacts", "avatars", "kv", "receipts", "messages_fts",
+	"members", "labels", "chat_labels", "votes", "stickers"}
 
 func openAppDB(path string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_txlock=immediate&_foreign_keys=off", path)
@@ -184,15 +247,43 @@ func openAppDB(path string) (*sql.DB, error) {
 			return nil, err
 		}
 		fillFTS = true
-		v = schemaVersion
+		v = 3
 	}
-	if v != 0 && v != schemaVersion {
-		// Unknown future/past layout: cache only, drop and resync.
-		for _, t := range appTables {
-			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
+	if v == 3 {
+		for _, q := range []string{
+			`ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chats ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chats ADD COLUMN limit_sharing INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chats ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0`,
+		} {
+			if _, err := db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 				return nil, err
 			}
 		}
+		v = 4
+	}
+	if v == 4 {
+		if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN extra TEXT NOT NULL DEFAULT ''`); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return nil, err
+		}
+		v = schemaVersion
+	}
+	if v > schemaVersion {
+		// Written by a newer build. Never touch it: an older copy of the app once
+		// dropped every table here (2026-10-02). Refuse, and leave the data alone.
+		db.Close()
+		return nil, fmt.Errorf("app.db has schema %d, newer than this build's %d; not opening it", v, schemaVersion)
+	}
+	if v != 0 && v != schemaVersion {
+		// An old layout no migration covers: move it aside (never drop it) and start
+		// a fresh one; the phone resyncs history.
+		db.Close()
+		aside := fmt.Sprintf("%s.schema%d-%d", path, v, time.Now().Unix())
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			os.Rename(path+suffix, aside+suffix)
+		}
+		return openAppDB(path)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
@@ -207,6 +298,8 @@ func openAppDB(path string) (*sql.DB, error) {
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return nil, err
 	}
+	// Saved stickers not downloaded yet keep their media reference here (added after v5).
+	db.Exec(`ALTER TABLE stickers ADD COLUMN media TEXT NOT NULL DEFAULT ''`)
 	// Pictures fetched before the avatars table existed live on chat rows.
 	db.Exec(`INSERT OR IGNORE INTO avatars (jid, path, ts) SELECT jid, avatar, avatar_ts FROM chats WHERE avatar != ''`)
 	return db, nil
@@ -257,6 +350,8 @@ type msgRow struct {
 	Waveform                   []byte
 	LinkURL, LinkTitle         string
 	LinkDesc                   string
+	Starred                    bool
+	Extra                      string // JSON, per kind
 }
 
 // upsertMessage inserts or refreshes a message. Status only ever moves forward,
@@ -264,8 +359,8 @@ type msgRow struct {
 func upsertMessage(x execer, m *msgRow) error {
 	_, err := x.Exec(`INSERT INTO messages
 		(chat, id, sender, push_name, from_me, ts, kind, text, status, quote_id, quote_sender, quote_text, quote_kind,
-		 mime, file_name, file_size, seconds, width, height, thumb, media, media_path, waveform, link_url, link_title, link_desc)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 mime, file_name, file_size, seconds, width, height, thumb, media, media_path, waveform, link_url, link_title, link_desc, starred, extra)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(chat, id) DO UPDATE SET
 			sender=excluded.sender,
 			push_name=CASE WHEN excluded.push_name != '' THEN excluded.push_name ELSE messages.push_name END,
@@ -280,11 +375,13 @@ func upsertMessage(x execer, m *msgRow) error {
 			media=CASE WHEN excluded.media != '' THEN excluded.media ELSE messages.media END,
 			media_path=CASE WHEN messages.media_path != '' THEN messages.media_path ELSE excluded.media_path END,
 			waveform=COALESCE(excluded.waveform, messages.waveform),
-			link_url=excluded.link_url, link_title=excluded.link_title, link_desc=excluded.link_desc`,
+			link_url=excluded.link_url, link_title=excluded.link_title, link_desc=excluded.link_desc,
+			starred=MAX(messages.starred, excluded.starred),
+			extra=CASE WHEN excluded.extra != '' THEN excluded.extra ELSE messages.extra END`,
 		m.Chat, m.ID, m.Sender, m.PushName, b2i(m.FromMe), m.TS, m.Kind, m.Text, m.Status,
 		m.QuoteID, m.QuoteSender, m.QuoteText, m.QuoteKind,
 		m.Mime, m.FileName, m.FileSize, m.Seconds, m.Width, m.Height, nilIfEmpty(m.Thumb), m.Media, m.MediaPath,
-		nilIfEmpty(m.Waveform), m.LinkURL, m.LinkTitle, m.LinkDesc)
+		nilIfEmpty(m.Waveform), m.LinkURL, m.LinkTitle, m.LinkDesc, b2i(m.Starred), m.Extra)
 	return err
 }
 

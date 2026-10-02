@@ -6,16 +6,57 @@ import UniformTypeIdentifiers
 /// under the floating sidebar) and accepts dropped images.
 final class DropView: NSView {
     var onDrop: ((URL) -> Void)?
+    /// A chat theme's picture (gradient or photo), aspect-filled under everything.
+    private let wallpaper = CALayer()
+    /// Washes a photo toward the canvas so text and bubbles stay readable.
+    private let wash = CALayer()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerForDraggedTypes([.fileURL])
+        wantsLayer = true
+        wallpaper.contentsGravity = .resizeAspectFill
+        wallpaper.masksToBounds = true
+        wallpaper.addSublayer(wash)
+        layer?.insertSublayer(wallpaper, at: 0)
+        NotificationCenter.default.addObserver(forName: Theme.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateWallpaper() }
+        }
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func draw(_ dirtyRect: NSRect) {
         Theme.canvas.setFill()
         dirtyRect.fill()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        wallpaper.frame = bounds
+        wash.frame = bounds
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateWallpaper()
+    }
+
+    func updateWallpaper() {
+        let t = ChatThemes.current
+        let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let img = t.isPicture ? Wallpapers.image(for: t, dark: dark) : nil
+        if img != nil, wallpaper.contents as! CGImage? !== img { Motion.crossfade(wallpaper, duration: 0.2) }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        wallpaper.contents = img
+        wallpaper.isHidden = img == nil
+        wash.backgroundColor = (dark ? NSColor.black : NSColor.white).cgColor
+        wash.opacity = Float(Wallpapers.wash(t))
+        CATransaction.commit()
+        needsDisplay = true
     }
 
     private func fileURL(_ info: NSDraggingInfo) -> URL? {
@@ -72,6 +113,10 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     private(set) var chat: Chat?
     var onHeader: ((String, String) -> Void)?
     var onProfile: (() -> Void)?
+    /// Opens another chat (from a contact card's Message button).
+    var onOpenChat: ((String) -> Void)?
+    /// The photo viewer opened (true) or closed.
+    var onViewer: ((Bool) -> Void)?
     private let capsule = HeaderCapsule()
     private let topBlur = EdgeBlurView()
     private var compose: NewMessageViewController?
@@ -87,10 +132,15 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     private var hasMoreLocal = true
     private var askedPhone = false
     private var reloading = false
-    private var replyTo: Message?
+    var replyTo: Message?
     private var editing: Message?
     var pendingImage: (path: String, thumb: String, w: Int, h: Int)?
     var pendingFile: PendingFile?
+    /// More files picked with the one in the composer; they follow it when it's sent.
+    var queuedAttachments: [URL] = []
+    var queueAsDocuments = false
+    /// The photo viewer, while it's open.
+    var viewer: MediaViewer?
     var inlineVideo: InlineVideo?
     var waveformTried: Set<String> = []
     var thumbRequested: Set<String> = []
@@ -192,7 +242,6 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             topBlur.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             topBlur.topAnchor.constraint(equalTo: view.topAnchor),
             topBlur.bottomAnchor.constraint(equalTo: safe.topAnchor, constant: 44),
-            // Hangs just under the toolbar avatar, like Messages.
             // Tucked under the toolbar avatar, like Messages: the avatar overlaps its top edge.
             capsule.topAnchor.constraint(equalTo: safe.topAnchor, constant: -12),
             capsule.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
@@ -246,6 +295,8 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         if c != nil { endCompose() }
         saveDraft()
         chat = c
+        ChatThemes.activate(c?.jid)
+        (view as? DropView)?.updateWallpaper()
         typing = [:]
         presence = nil
         replyTo = nil
@@ -399,12 +450,14 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     func mediaFailed(id: String, status: String) {
         // Auto-downloads fail quietly (the thumbnail stays); only explain user-initiated opens.
         guard pendingOpen == id else { return }
+        // The server dropped it and the phone was asked to upload it again: keep waiting.
+        if status == "retrying" { return }
         pendingOpen = nil
         NSSound.beep()
         if status == "expired", let window = view.window {
             let a = NSAlert()
             a.messageText = "This media is no longer available"
-            a.informativeText = "Ask the sender to send it again."
+            a.informativeText = "WhatsApp's servers no longer have it, and your phone couldn't send it again. Ask the sender to send it again."
             a.beginSheetModal(for: window)
         }
     }
@@ -854,7 +907,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     func toggleVoice(_ m: Message) {
         if m.mediaPath.isEmpty {
             pendingOpen = m.id
-            Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id])
+            Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id, "retry": true])
             return
         }
         AudioPlayback.shared.toggle(m)
@@ -924,22 +977,43 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             return
         }
         guard m.hasMedia || !m.mediaPath.isEmpty else { return }
+        if m.kind == .image {
+            showViewer(m)   // shows the thumbnail and fetches the photo if it isn't here yet
+            return
+        }
+        if m.kind == .sticker {
+            if !m.mediaPath.isEmpty, FileManager.default.fileExists(atPath: m.mediaPath) {
+                openStickerCard(m)
+            } else {
+                // Not here yet: fetch it (from the phone if the server dropped it), then open.
+                pendingOpen = m.id
+                Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id, "retry": true])
+            }
+            return
+        }
         if !m.mediaPath.isEmpty, FileManager.default.fileExists(atPath: m.mediaPath) {
             let url = URL(fileURLWithPath: m.mediaPath)
             if m.kind == .video {
                 playInline(m, url: url)
-            } else if m.kind == .image || m.kind == .sticker {
-                previewURL = url
-                if let panel = QLPreviewPanel.shared() {
-                    if panel.isVisible { panel.reloadData() } else { panel.makeKeyAndOrderFront(nil) }
-                }
+            } else if m.kind == .image {
+                showViewer(m)
+            } else if m.kind == .sticker {
+                return   // a sticker is part of the conversation, not a photo to open
             } else {
                 NSWorkspace.shared.open(url)
             }
             return
         }
         pendingOpen = m.id
-        Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id])
+        Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id, "retry": true])
+    }
+
+    /// A sticker's card, anchored on its bubble.
+    func openStickerCard(_ m: Message) {
+        guard let row = rowIndex(of: m.id),
+              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView,
+              let r = cell.item?.mediaRect else { return }
+        showStickerCard(m, from: cell, at: r)
     }
 
     func menu(for m: Message) -> NSMenu {
@@ -951,6 +1025,13 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         }
         let live = m.kind != .revoked && m.kind != .pending
         if live { item("Reply", "arrowshape.turn.up.left") { [weak self] in self?.reply(to: m) } }
+        if m.kind == .sticker, !m.mediaPath.isEmpty {
+            let sticker = StickerItem(path: m.mediaPath, mime: m.mime, width: m.width, height: m.height)
+            let fav = StickerLibrary.hash(of: m.mediaPath).map { store.isFavoriteSticker(hash: $0) } ?? false
+            item(fav ? "Remove from Favorites" : "Add to Favorites", fav ? "star.slash" : "star") {
+                ConversationViewController.setFavorite(sticker, !fav)
+            }
+        }
         if live {
             let react = NSMenuItem(title: "React", action: nil, keyEquivalent: "")
             react.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: nil)
@@ -967,6 +1048,12 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             }
             react.submenu = sub
             menu.addItem(react)
+        }
+        if live {
+            item(m.starred ? "Unstar" : "Star", m.starred ? "star.slash" : "star") { [weak self] in
+                guard let chat = self?.chat?.jid else { return }
+                Task { _ = await Core.shared.callAsync("star", ["chat": chat, "id": m.id, "on": !m.starred]) }
+            }
         }
         if !m.text.isEmpty && live {
             item("Copy", "doc.on.doc") {
@@ -1036,7 +1123,13 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             return
         }
         var res: [String: Any]
-        if let f = pendingFile {
+        var textAfter = ""
+        if let f = pendingFile, f.isAudio {
+            // Audio has no caption; any text goes after it as its own message.
+            res = Core.shared.call("send_audio", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime,
+                                                  "seconds": f.seconds, "quote": replyTo?.id ?? ""])
+            textAfter = trimmed
+        } else if let f = pendingFile {
             res = Core.shared.call("send_file", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime, "text": trimmed,
                                                  "thumb": f.thumb ?? "", "width": f.width, "height": f.height,
                                                  "seconds": f.seconds, "quote": replyTo?.id ?? ""])
@@ -1059,6 +1152,8 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             return
         }
         if Prefs.outgoingSound { NSSound(named: "Pop")?.play() }
+        if !textAfter.isEmpty { _ = Core.shared.call("send_text", ["chat": c.jid, "text": textAfter]) }
+        sendQueuedAttachments()
         composer.text = ""
         drafts[c.jid] = nil
         replyTo = nil
@@ -1102,17 +1197,16 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: stop)
     }
 
-    func composerAttach() {
-        guard let window = view.window else { return }
-        let p = NSOpenPanel()
-        p.allowedContentTypes = [.item]
-        p.allowsMultipleSelection = false
-        p.message = "Photos and videos send inline; anything else goes as a document."
-        p.beginSheetModal(for: window) { [weak self] resp in
-            guard resp == .OK, let url = p.url else { return }
-            MainActor.assumeIsolated { self?.attach(url) }
-        }
+    func composerAttach(from anchor: NSView) {
+        showAttachMenu(from: anchor)
     }
+
+    func composerExpressions(from anchor: NSView) {
+        showExpressions(from: anchor)
+    }
+
+    /// The composer's ☺ button (dev hook).
+    var expressionAnchor: NSView { composer.expressionAnchor }
 
     func composerCancelReply() {
         if editing != nil { composer.text = "" }
@@ -1124,6 +1218,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     func composerCancelAttachment() {
         pendingImage = nil
         pendingFile = nil
+        queuedAttachments = []
         composer.hideAttachment(animated: true)
     }
 
@@ -1146,12 +1241,16 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
                     guard let out, self.chat?.jid == jid else { NSSound.beep(); return }
                     self.pendingImage = (out.path, out.thumb, out.w, out.h)
                     if let img = NSImage(contentsOfFile: out.thumb) {
-                        self.composer.showAttachment(img, label: "Photo · \(out.w)×\(out.h). Add a caption, then press Return.")
+                        self.composer.showAttachment(img, label: "Photo · \(out.w)×\(out.h)\(self.queuedSuffix). Add a caption, then press Return.")
                     }
                     self.composer.focus()
                 }
             }
         }
+    }
+
+    @concurrent nonisolated static func encodePhoto(_ url: URL) async -> (path: String, thumb: String, w: Int, h: Int)? {
+        encode(url)
     }
 
     nonisolated private static func encode(_ url: URL) -> (path: String, thumb: String, w: Int, h: Int)? {

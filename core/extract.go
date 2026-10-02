@@ -85,6 +85,9 @@ func (a *App) content(m *waE2E.Message, r *msgRow) bool {
 		r.Seconds, r.FileSize, r.Media = int(x.GetSeconds()), int64(x.GetFileLength()), refFor(x, "video")
 		if x.GetGifPlayback() {
 			r.FileName = "GIF"
+			if a := gifSource(x.GetGifAttribution()); a != "" {
+				r.Extra = jsonString(map[string]string{"gif": a})
+			}
 		}
 	case m.GetAudioMessage() != nil:
 		x := m.GetAudioMessage()
@@ -121,27 +124,27 @@ func (a *App) content(m *waE2E.Message, r *msgRow) bool {
 	case m.GetContactMessage() != nil:
 		x := m.GetContactMessage()
 		r.Kind, r.Text, ci = KContact, x.GetDisplayName(), x.GetContextInfo()
+		r.Extra = jsonString(contactExtra{Cards: []contactCard{parseVCard(x.GetDisplayName(), x.GetVcard())}})
 	case m.GetContactsArrayMessage() != nil:
 		x := m.GetContactsArrayMessage()
 		r.Kind, r.Text, ci = KContact, fmt.Sprintf("%d contacts", len(x.GetContacts())), x.GetContextInfo()
-	case m.GetPollCreationMessageV3() != nil || m.GetPollCreationMessage() != nil || m.GetPollCreationMessageV2() != nil:
-		x := m.GetPollCreationMessageV3()
-		if x == nil {
-			x = m.GetPollCreationMessage()
+		var cards []contactCard
+		for _, c := range x.GetContacts() {
+			cards = append(cards, parseVCard(c.GetDisplayName(), c.GetVcard()))
 		}
-		if x == nil {
-			x = m.GetPollCreationMessageV2()
-		}
-		r.Kind, ci = KPoll, x.GetContextInfo()
-		var b strings.Builder
-		b.WriteString(x.GetName())
+		r.Extra = jsonString(contactExtra{Cards: cards})
+	case pollCreation(m) != nil:
+		x := pollCreation(m)
+		r.Kind, r.Text, ci = KPoll, x.GetName(), x.GetContextInfo()
+		opts := make([]string, 0, len(x.GetOptions()))
 		for _, o := range x.GetOptions() {
-			b.WriteString("\n○ " + o.GetOptionName())
+			opts = append(opts, o.GetOptionName())
 		}
-		r.Text = b.String()
+		r.Extra = jsonString(pollExtra{Options: opts, Multi: x.GetSelectableOptionsCount() != 1})
 	case m.GetEventMessage() != nil:
 		x := m.GetEventMessage()
-		r.Kind, r.Text, ci = KText, "📅 "+x.GetName(), x.GetContextInfo()
+		r.Kind, r.Text, ci = KEvent, x.GetName(), x.GetContextInfo()
+		r.Extra = jsonString(eventFrom(x))
 	case m.GetGroupInviteMessage() != nil:
 		x := m.GetGroupInviteMessage()
 		r.Kind, r.Text, ci = KText, "Group invite: "+x.GetGroupName(), x.GetContextInfo()
@@ -205,13 +208,13 @@ func previewText(r *msgRow) string {
 	labels := map[int]string{
 		KImage: "📷 Photo", KVideo: "🎥 Video", KAudio: "🎵 Audio", KVoice: "🎤 Voice message",
 		KDocument: "📄 Document", KSticker: "Sticker", KLocation: "📍 Location", KContact: "👤 Contact",
-		KPoll: "📊 Poll",
+		KPoll: "📊 Poll", KEvent: "📅 Event",
 	}
 	if r.Kind == KText || r.Kind == KUnsupported {
 		return r.Text
 	}
 	l := labels[r.Kind]
-	if r.Text != "" && r.Kind != KPoll {
+	if r.Text != "" {
 		return l + ": " + strings.SplitN(r.Text, "\n", 2)[0]
 	}
 	if r.Kind == KDocument && r.FileName != "" {

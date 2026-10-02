@@ -67,6 +67,23 @@ enum Fmt {
 
     static func duration(_ s: Int) -> String { String(format: "%d:%02d", s / 60, s % 60) }
 
+    /// Size of a file on disk, 0 when it's gone.
+    static func fileSize(_ path: String) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    /// A disappearing-message timer as WhatsApp words it.
+    static func timer(_ seconds: Int) -> String {
+        switch seconds {
+        case 0: "Off"
+        case 86_400: "24 hours"
+        case 604_800: "7 days"
+        case 7_776_000: "90 days"
+        default:
+            seconds % 86_400 == 0 ? "\(seconds / 86_400) days" : seconds % 3600 == 0 ? "\(seconds / 3600) hours" : "\(seconds / 60) minutes"
+        }
+    }
+
     static func bytes(_ n: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
     }

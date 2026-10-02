@@ -133,6 +133,9 @@ final class Core {
         case "sync": event = .sync(progress: (o["progress"] as? Int) ?? Int(o["progress"] as? Double ?? 0))
         case "media": event = .media(chat: s("chat"), id: s("id"), status: s("status"))
         case "avatar": return // the core follows up with a "chats" event
+        case "stickers":
+            NotificationCenter.default.post(name: StickerLibrary.changed, object: nil)
+            return
         case "error": event = .error(s("msg"))
         default: return
         }

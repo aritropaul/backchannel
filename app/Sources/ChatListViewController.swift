@@ -33,16 +33,22 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     enum Item {
         case pinned([Chat])
         case archived(count: Int, unread: Int)
-        case back
+        /// Locked chats (Touch ID to open), revealed by the same pull as Archived.
+        case locked(count: Int)
+        case back(String)
         case chat(Chat)
         case header(String)
         case hit(Store.SearchHit)
+        /// The short rule between pinned chats and the rest in the compact column.
+        case divider
 
         var key: String {
             switch self {
             case .pinned: "~pinned"
             case .archived: "~archived"
+            case .locked: "~locked"
             case .back: "~back"
+            case .divider: "~divider"
             case .chat(let c): c.jid
             case .header(let t): "~h:" + t
             case .hit(let h): "~m:\(h.chat)/\(h.id)"
@@ -53,9 +59,29 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     let store: Store
     weak var delegate: ChatListDelegate?
 
+    /// The sidebar never closes. Dragged narrower than `fullMinWidth` it snaps to
+    /// `compactWidth`, Messages' column of avatars (see `MainSplitViewController`).
+    static let compactWidth: CGFloat = 94
+    static let fullMinWidth: CGFloat = 280
+    /// Below this width the list draws as the compact column.
+    private static let compactBelow: CGFloat = (compactWidth + fullMinWidth) / 2
+    /// How far past the top a pull has to go before letting go shows Archived.
+    private static let pullThreshold: CGFloat = 56
+    private(set) var compact = false
+    /// Archived stays out of the list until a deliberate pull down past its top.
+    private var archiveRevealed = false
+    private var pullArmed = false
+    private var fullTop: NSLayoutConstraint!
+    private var compactTop: NSLayoutConstraint!
+    private var scrollMonitor: Any?
+
     private(set) var items: [Item] = []
     private var all: [Chat] = []
     private var showingArchived = false
+    /// Inside "Locked chats", after Touch ID. Leaving it locks them again.
+    private var showingLocked = false
+    /// Search limited to one chat (the contact panel's Search button).
+    private var scope: Chat?
     private var filter = 0
     private var query = "" {
         didSet {
@@ -127,6 +153,10 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         }
 
         let col = NSTableColumn(identifier: .init("c"))
+        // Start narrow: the column only grows to fit, so AppKit's default 100pt would keep
+        // the table wider than the 94pt compact column when the app opens compact.
+        col.width = 40
+        col.minWidth = 20
         tableView.addTableColumn(col)
         tableView.headerView = nil
         tableView.style = .sourceList
@@ -148,6 +178,8 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
+        scrollView.verticalScrollElasticity = .allowed   // a short list still has to pull
+        scrollView.wantsLayer = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         [search, filters, status, scrollView].forEach(v.addSubview)
@@ -164,12 +196,109 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             status.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
             status.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -12),
             statusHeight,
-            scrollView.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 4),
             scrollView.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: v.bottomAnchor),
         ])
+        fullTop = scrollView.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 4)
+        // Messages starts the avatar column right under the traffic lights.
+        compactTop = scrollView.topAnchor.constraint(equalTo: v.safeAreaLayoutGuide.topAnchor, constant: -10)
+        fullTop.isActive = true
+
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] e in
+            self?.trackPull(e)
+            return e
+        }
+        // Locking or unlocking a chat moves it in or out of the list.
+        NotificationCenter.default.addObserver(forName: Prefs.changed, object: nil, queue: .main) { [weak self] n in
+            let key = n.object as? String
+            MainActor.assumeIsolated {
+                if key == "WA.lockedChats" { self?.reload() }
+            }
+        }
+        NotificationCenter.default.addObserver(forName: NSScrollView.didEndLiveScrollNotification, object: scrollView,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.hideArchiveIfScrolledAway() }
+        }
     }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let narrow = view.bounds.width < Self.compactBelow
+        if narrow != compact { setCompact(narrow) }
+    }
+
+    /// Messages' compact sidebar: no search or filter, pinned chats first as plain
+    /// avatars, a short rule, then everything else.
+    private func setCompact(_ on: Bool) {
+        compact = on
+        for v in [search, filters, status] as [NSView] { v.isHidden = on }
+        fullTop.isActive = !on
+        compactTop.isActive = on
+        if on, let editor = search.currentEditor(), view.window?.firstResponder === editor {
+            view.window?.makeFirstResponder(tableView)
+        }
+        Motion.crossfade(scrollView.layer)
+        rebuildItems(animated: false)
+        if let jid = selectedJID, let i = index(of: jid) { tableView.scrollRowToVisible(i) }
+    }
+
+    // MARK: pull for Archived
+
+    /// Pulling past the top with fingers still on the trackpad arms the reveal, with a
+    /// haptic tick; letting go shows Archived. Momentum bounces never count, so a fling
+    /// to the top doesn't open it by accident.
+    private func trackPull(_ e: NSEvent) {
+        guard e.window === view.window, !archiveRevealed, !showingArchived, !showingLocked, isPlain,
+              scrollView.bounds.contains(scrollView.convert(e.locationInWindow, from: nil)) else {
+            pullArmed = false
+            return
+        }
+        switch e.phase {
+        case .began, .cancelled:
+            pullArmed = false
+        case .changed:
+            let top = -scrollView.contentInsets.top
+            if !pullArmed, scrollView.contentView.bounds.minY < top - Self.pullThreshold,
+               store.archivedSummary().count > 0 || !ChatPrefs.locked.isEmpty {
+                pullArmed = true
+                NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+            }
+        case .ended:
+            guard pullArmed else { return }
+            pullArmed = false
+            revealArchive()
+        default:
+            break
+        }
+    }
+
+    /// Shows the Archived row at the top of the list (also the dev hook `WA_PULL`).
+    func revealArchive() {
+        guard !archiveRevealed else { return }
+        archiveRevealed = true
+        rebuildItems(animated: true)
+    }
+
+    /// Once Archived has scrolled out of sight and the scroll settles, it hides again
+    /// without moving anything that's on screen.
+    private func hideArchiveIfScrolledAway() {
+        let revealed = items.indices.filter { i in
+            switch items[i] { case .archived, .locked: true; default: false }
+        }
+        guard archiveRevealed, !showingArchived, !showingLocked, let last = revealed.last else { return }
+        let rows = tableView.rect(ofRow: revealed[0]).union(tableView.rect(ofRow: last))
+        let clip = scrollView.contentView
+        guard clip.bounds.minY >= rows.maxY else { return }
+        let y = clip.bounds.minY - rows.height
+        archiveRevealed = false
+        rebuildItems(animated: false)
+        clip.scroll(to: NSPoint(x: 0, y: y))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    /// No search and no filter: the list Archived belongs to.
+    private var isPlain: Bool { compact || (query.isEmpty && filter == 0) }
 
     // MARK: data
 
@@ -187,38 +316,60 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     func reload(animated: Bool = false) {
         lastReload = Date()
-        all = store.chats(archived: showingArchived)
+        let locked = ChatPrefs.locked
+        if showingLocked {
+            all = (store.chats(archived: false) + store.chats(archived: true)).filter { locked.contains($0.jid) }
+        } else {
+            all = store.chats(archived: showingArchived).filter { !locked.contains($0.jid) }
+        }
         rebuildItems(animated: animated)
     }
 
     private func rebuildItems(animated: Bool) {
+        // The compact column has no search field or filter to show, so it lists everything;
+        // both come back as they were when the sidebar widens again.
+        let q = compact ? "" : query
+        let f = compact ? 0 : filter
         var list = all
-        if filter == 1 { list = list.filter { $0.hasUnread || $0.jid == selectedJID } }
-        if filter == 2 { list = list.filter(\.isGroup) }
-        if !query.isEmpty {
-            list = list.filter { $0.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil || $0.jid.contains(query) }
+        if f == 1 { list = list.filter { $0.hasUnread || $0.jid == selectedJID } }
+        if f == 2 { list = list.filter(\.isGroup) }
+        if !q.isEmpty {
+            list = list.filter { $0.name.range(of: q, options: [.caseInsensitive, .diacriticInsensitive]) != nil || $0.jid.contains(q) }
         }
         var out: [Item] = []
-        let plain = query.isEmpty && filter == 0
-        if showingArchived {
-            out.append(.back)
-        } else if plain {
+        if showingLocked {
+            out.append(.back("Locked chats"))
+        } else if showingArchived {
+            out.append(.back("Archived"))
+        } else if q.isEmpty && f == 0 {
+            if archiveRevealed {
+                let a = store.archivedSummary()
+                if a.count > 0 { out.append(.archived(count: a.count, unread: a.unread)) }
+                let locked = ChatPrefs.locked.count
+                if locked > 0 { out.append(.locked(count: locked)) }
+            }
             let pinned = list.filter(\.pinned)
             if !pinned.isEmpty {
-                out.append(.pinned(pinned))
                 list = list.filter { !$0.pinned }
+                if compact {
+                    out += pinned.map { .chat($0) }
+                    if !list.isEmpty { out.append(.divider) }
+                } else {
+                    out.append(.pinned(pinned))
+                }
             }
-            let a = store.archivedSummary()
-            if a.count > 0 { out.append(.archived(count: a.count, unread: a.unread)) }
         }
-        if query.isEmpty {
+        if q.isEmpty {
             out += list.map { .chat($0) }
         } else {
-            // Search: matching conversations, then matching messages across every chat.
-            // Message hits stay from the last search until the next one lands, so
-            // they don't blink out on every keystroke.
-            if !list.isEmpty { out.append(.header("Conversations")); out += list.map { .chat($0) } }
-            if !hits.isEmpty { out.append(.header("Messages")); out += hits.map { .hit($0) } }
+            // Search: matching conversations, then matching messages across every chat
+            // (or only the scoped one). Message hits stay from the last search until the
+            // next one lands, so they don't blink out on every keystroke. Locked chats
+            // never show up outside "Locked chats".
+            let locked = showingLocked ? [] : ChatPrefs.locked
+            if scope == nil, !list.isEmpty { out.append(.header("Conversations")); out += list.map { .chat($0) } }
+            let shown = hits.filter { !locked.contains($0.chat) }
+            if !shown.isEmpty { out.append(.header(scope.map { "Messages in \($0.name)" } ?? "Messages")); out += shown.map { .hit($0) } }
         }
         applyItems(out, animated: animated)
     }
@@ -271,12 +422,14 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         for i in range.location..<min(items.count, range.location + range.length) {
             switch (items[i], tableView.view(atColumn: 0, row: i, makeIfNecessary: false)) {
             case (.chat(let c), let cell as ChatCellView):
+                cell.compact = compact
                 cell.configure(c, typing: isTyping(c.jid))
             case (.pinned(let chats), _):
                 pinnedGrid.configure(chats, selected: selectedJID)
                 heights.insert(i)
             case (.archived(let n, let u), let cell as ListLinkCellView):
                 fillArchived(cell, n, u)
+                cell.style = compact ? .compact : .entry
             case (.hit(let h), let cell as ChatCellView):
                 if let c = chat(h.chat) ?? store.chat(h.chat) { cell.configure(hit: h, in: c) }
             default: break
@@ -365,6 +518,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         typing[chat] = on ? Date().addingTimeInterval(25) : nil
         guard let i = index(of: chat), case .chat(let c) = items[i],
               let cell = tableView.view(atColumn: 0, row: i, makeIfNecessary: false) as? ChatCellView else { return }
+        cell.compact = compact
         cell.configure(c, typing: isTyping(chat))
     }
 
@@ -384,9 +538,34 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     // MARK: actions
 
+    /// The contact panel's Search: the field searches only this chat's messages until
+    /// it's cleared.
+    func searchIn(_ c: Chat) {
+        // Coming from the compact column: let the sidebar widen and show its field first.
+        view.window?.layoutIfNeeded()
+        scope = c
+        searchedQuery = ""
+        hits = []
+        search.placeholderString = "Search \(c.name)"
+        search.stringValue = ""
+        query = ""
+        focusSearch()
+        rebuildItems(animated: false)
+    }
+
+    private func clearScope() {
+        guard scope != nil else { return }
+        scope = nil
+        searchedQuery = ""
+        search.placeholderString = "Search"
+    }
+
     @objc private func searchChanged() {
         query = search.stringValue.trimmingCharacters(in: .whitespaces)
-        if query.isEmpty { selectedHit = nil }
+        if query.isEmpty {
+            selectedHit = nil
+            clearScope()
+        }
         rebuildItems(animated: false)
         scheduleMessageSearch()
     }
@@ -408,8 +587,13 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         pendingSearch = nil
         guard !query.isEmpty else { return }
         searchedQuery = query
-        hits = store.searchMessages(query)
+        hits = store.searchMessages(query, in: scope?.jid)
         rebuildItems(animated: false)
+    }
+
+    /// Leaving the field empty ends a chat-scoped search.
+    func controlTextDidEndEditing(_ obj: Notification) {
+        if search.stringValue.trimmingCharacters(in: .whitespaces).isEmpty { clearScope() }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
@@ -434,14 +618,31 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         guard row >= 0, row < items.count else { return }
         switch items[row] {
         case .archived: showArchive(true)
-        case .back: showArchive(false)
+        case .locked: openLocked()
+        case .back: showingLocked ? closeLocked() : showArchive(false)
         default: break
         }
+    }
+
+    /// Touch ID (or the Mac's password), then the locked chats.
+    func openLocked() {
+        ChatPrefs.authenticate("open your locked chats") { [weak self] ok in
+            guard ok, let self else { return }
+            self.showingLocked = true
+            self.reload()
+            self.tableView.scrollRowToVisible(0)
+        }
+    }
+
+    private func closeLocked() {
+        showingLocked = false
+        reload()
     }
 
     func showArchive(_ on: Bool) {
         showingArchived = on
         reload()
+        tableView.scrollRowToVisible(0)
     }
 
     // MARK: table
@@ -453,6 +654,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         case .chat, .hit: 80
         case .pinned(let cs): PinnedGridView.height(for: cs.count)
         case .header: 30
+        case .divider: 10
         default: 44
         }
     }
@@ -460,7 +662,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let r = SidebarRowView()
         switch items[row] {
-        case .chat, .hit: r.showsSeparator = true
+        case .chat, .hit: r.showsSeparator = !compact
         default: break
         }
         return r
@@ -472,6 +674,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
             let id = NSUserInterfaceItemIdentifier("chat")
             let v = tableView.makeView(withIdentifier: id, owner: nil) as? ChatCellView ?? ChatCellView()
             v.identifier = id
+            v.compact = compact
             v.configure(c, typing: isTyping(c.jid))
             return v
         case .pinned(let chats):
@@ -480,12 +683,31 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         case .archived(let n, let unread):
             let v = linkCell()
             fillArchived(v, n, unread)
+            v.style = compact ? .compact : .entry
             return v
-        case .back:
+        case .locked(let n):
             let v = linkCell()
-            v.icon.image = NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: nil)
-            v.label.stringValue = "Archived"
+            v.icon.image = NSImage(systemSymbolName: "lock", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
+            v.label.stringValue = "Locked chats"
+            v.count.stringValue = "\(n)"
+            v.highlightsCount = false
+            v.toolTip = compact ? "Locked chats" : nil
+            v.style = compact ? .compact : .entry
+            return v
+        case .back(let title):
+            let v = linkCell()
+            v.icon.image = NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: "Back to Chats")?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+            v.label.stringValue = title
             v.count.stringValue = ""
+            v.toolTip = "Back to Chats"
+            v.style = compact ? .compact : .header
+            return v
+        case .divider:
+            let id = NSUserInterfaceItemIdentifier("divider")
+            let v = tableView.makeView(withIdentifier: id, owner: nil) as? DividerCellView ?? DividerCellView()
+            v.identifier = id
             return v
         case .header(let title):
             let id = NSUserInterfaceItemIdentifier("header")
@@ -503,9 +725,12 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     }
 
     private func fillArchived(_ v: ListLinkCellView, _ n: Int, _ unread: Int) {
-        v.icon.image = NSImage(systemSymbolName: "archivebox", accessibilityDescription: nil)
+        v.icon.image = NSImage(systemSymbolName: "archivebox", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
         v.label.stringValue = "Archived"
         v.count.stringValue = unread > 0 ? "\(unread) unread" : "\(n)"
+        v.highlightsCount = unread > 0
+        v.toolTip = compact ? "Archived (\(n))" : nil
     }
 
     private func linkCell() -> ListLinkCellView {
@@ -528,6 +753,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         guard row >= 0, row < items.count else { return }
         switch items[row] {
         case .chat(let c) where c.jid != selectedJID || selectedHit != nil:
+            if query.isEmpty { clearScope() }   // moved on without searching
             selectedJID = c.jid
             selectedHit = nil
             pinnedGrid.setSelected(c.jid)

@@ -219,6 +219,14 @@ final class ChatCellView: NSTableCellView {
     let muted = NSImageView()
     private(set) var chat: Chat?
     private var typing = false
+    /// Messages' compact sidebar: only the avatar, centred, with the unread dot beside it.
+    var compact = false {
+        didSet {
+            guard compact != oldValue else { return }
+            for v in [name, time, preview] as [NSView] { v.isHidden = compact }
+            needsLayout = true
+        }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -243,10 +251,17 @@ final class ChatCellView: NSTableCellView {
     override func layout() {
         super.layout()
         let w = bounds.width
+        if compact {
+            avatar.frame = NSRect(x: ((w - 40) / 2).rounded(), y: (bounds.height - 40) / 2, width: 40, height: 40)
+            dot.frame = NSRect(x: avatar.frame.minX - 13, y: (bounds.height - 9) / 2, width: 9, height: 9)
+            return
+        }
         dot.frame = NSRect(x: 1, y: (bounds.height - 9) / 2, width: 9, height: 9)
         avatar.frame = NSRect(x: 14, y: (bounds.height - 40) / 2, width: 40, height: 40)
-        // Name + two preview lines as one block, centred in the row like Messages.
-        let x = Self.textX, top = (bounds.height - 52) / 2
+        // Name + two preview lines as one block, centred in the row like Messages. With no
+        // preview (old chats whose history didn't sync), the name alone sits on the avatar's centre.
+        let blockH: CGFloat = preview.stringValue.isEmpty && hit == nil ? 18 : 52
+        let x = Self.textX, top = ((bounds.height - blockH) / 2).rounded()
         time.sizeToFit()
         let tw = time.frame.width
         time.frame = NSRect(x: w - 12 - tw, y: top + 1, width: tw, height: 17)
@@ -306,6 +321,7 @@ final class ChatCellView: NSTableCellView {
             text.append(ch)
         }
         hit = (text.replacingOccurrences(of: "\n", with: " "), ranges)
+        toolTip = nil
         avatar.load(c, px: 80)
         applyColors()
         setAccessibilityLabel("\(c.name), \(text)")
@@ -321,8 +337,9 @@ final class ChatCellView: NSTableCellView {
         name.stringValue = c.name
         time.stringValue = c.lastTS > 0 ? Fmt.listStamp(Date(timeIntervalSince1970: TimeInterval(c.lastTS) / 1000)) : ""
         dot.isHidden = !c.hasUnread
-        muted.isHidden = !c.isMuted
+        muted.isHidden = compact || !c.isMuted
         preview.stringValue = Self.previewText(c, typing: typing)
+        toolTip = compact ? c.name : nil
         avatar.load(c, px: 80)
         applyColors()
         setAccessibilityLabel("\(c.name), \(c.hasUnread ? "unread, " : "")\(preview.stringValue)")
@@ -473,35 +490,101 @@ final class PinnedGridView: NSView {
     }
 }
 
-/// "Archived" entry and the back row inside the archive.
+/// The "Archived" row (shown when the list is pulled down) and the header inside the archive.
 final class ListLinkCellView: NSTableCellView {
+    enum Style {
+        /// In the chat list: the same columns as a chat row, so the icon sits on the
+        /// avatars' centre line, the label on the names and the count on the times.
+        case entry
+        /// Inside the archive: "‹ Archived" as a title, the chevron on the avatars' edge.
+        case header
+        /// The compact column: just the icon, centred.
+        case compact
+    }
+
     let icon = NSImageView()
     let label = NSTextField(labelWithString: "")
     let count = NSTextField(labelWithString: "")
+    var style: Style = .entry { didSet { applyStyle() } }
+    /// Unread archived chats: the count wears the accent, like an unread dot.
+    var highlightsCount = false { didSet { applyColors() } }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        label.font = .systemFont(ofSize: 13, weight: .medium)
-        count.font = .systemFont(ofSize: 12)
-        count.textColor = .secondaryLabelColor
+        count.font = .systemFont(ofSize: 13)
         count.alignment = .right
         [icon, label, count].forEach(addSubview)
+        applyStyle()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }
+
+    private func applyStyle() {
+        label.font = style == .header ? .systemFont(ofSize: 15, weight: .bold) : .systemFont(ofSize: 13, weight: .semibold)
+        label.isHidden = style == .compact
+        count.isHidden = style != .entry
+        needsLayout = true
+        applyColors()
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        switch style {
+        case .compact:
+            icon.frame = NSRect(x: ((bounds.width - 22) / 2).rounded(), y: (h - 20) / 2, width: 22, height: 20)
+        case .header:
+            icon.frame = NSRect(x: 12, y: (h - 20) / 2, width: 16, height: 20)
+            label.frame = NSRect(x: icon.frame.maxX + 6, y: ((h - 20) / 2).rounded(), width: bounds.width - icon.frame.maxX - 18, height: 20)
+        case .entry:
+            // ChatCellView's columns: 40pt avatar at x 14, text at `textX`, times 12pt from the edge.
+            icon.frame = NSRect(x: 14 + 9, y: (h - 20) / 2, width: 22, height: 20)
+            count.sizeToFit()
+            let cw = count.frame.width
+            count.frame = NSRect(x: bounds.width - 12 - cw, y: ((h - 17) / 2).rounded(), width: cw, height: 17)
+            label.frame = NSRect(x: ChatCellView.textX, y: ((h - 18) / 2).rounded(), width: count.frame.minX - 8 - ChatCellView.textX, height: 18)
+        }
+    }
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { applyColors() }
+    }
+
+    private func applyColors() {
+        let sel = backgroundStyle == .emphasized
+        label.textColor = sel ? Theme.onSelection : .labelColor
+        icon.contentTintColor = sel ? Theme.onSelectionSecondary : style == .header ? .labelColor : .secondaryLabelColor
+        count.textColor = sel ? Theme.onSelectionSecondary : highlightsCount ? Theme.accent : .secondaryLabelColor
+    }
+}
+
+/// The short rule between pinned chats and the rest of the compact column, as in Messages.
+final class DividerCellView: NSTableCellView {
+    private let line = NSView()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        line.wantsLayer = true
+        line.layer?.cornerRadius = 1
+        addSubview(line)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func layout() {
         super.layout()
-        icon.frame = NSRect(x: 23, y: (bounds.height - 20) / 2, width: 22, height: 20)
-        count.sizeToFit()
-        count.frame = NSRect(x: bounds.width - 14 - count.frame.width, y: (bounds.height - 16) / 2, width: count.frame.width, height: 16)
-        label.frame = NSRect(x: 65, y: (bounds.height - 18) / 2, width: count.frame.minX - 73, height: 18)
+        let w = min(54, bounds.width - 8)
+        line.frame = NSRect(x: ((bounds.width - w) / 2).rounded(), y: (bounds.height - 2) / 2, width: w, height: 2)
+        updateColor()
     }
 
-    override var backgroundStyle: NSView.BackgroundStyle {
-        didSet {
-            let sel = backgroundStyle == .emphasized
-            label.textColor = sel ? Theme.onSelection : .labelColor
-            icon.contentTintColor = sel ? Theme.onSelectionSecondary : .secondaryLabelColor
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColor()
+    }
+
+    private func updateColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            line.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
         }
     }
 }

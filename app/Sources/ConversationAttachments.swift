@@ -13,6 +13,8 @@ struct PendingFile {
     var width = 0
     var height = 0
     var seconds = 0
+    /// Music sent as audio (the player bubble), not as a document.
+    var isAudio = false
     var isVideo: Bool { mime.hasPrefix("video/") && thumb != nil }
 }
 
@@ -32,13 +34,13 @@ extension ConversationViewController {
         }
     }
 
-    private func prepareDocument(_ url: URL, type: UTType) {
+    func prepareDocument(_ url: URL, type: UTType) {
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         guard size > 0, size <= 2_000_000_000 else { NSSound.beep(); return }   // WhatsApp's document limit is 2 GB
         pendingImage = nil
         pendingFile = PendingFile(path: url.path, name: url.lastPathComponent, mime: type.preferredMIMEType ?? "application/octet-stream")
         composer.showAttachment(NSWorkspace.shared.icon(forFile: url.path),
-                                label: "\(url.lastPathComponent) · \(Fmt.bytes(size))")
+                                label: "\(url.lastPathComponent) · \(Fmt.bytes(size))\(queuedSuffix)")
         composer.focus()
     }
 
@@ -58,7 +60,7 @@ extension ConversationViewController {
             self.pendingFile = out
             let thumb = out.thumb.flatMap { NSImage(contentsOfFile: $0) }
                 ?? NSImage(systemSymbolName: "video", accessibilityDescription: nil) ?? NSImage()
-            self.composer.showAttachment(thumb, label: "Video · \(Fmt.duration(out.seconds))")
+            self.composer.showAttachment(thumb, label: "Video · \(Fmt.duration(out.seconds))\(self.queuedSuffix)")
             self.composer.focus()
         }
     }
@@ -102,14 +104,15 @@ final class InlineVideo {
     let id: String
     let view: AVPlayerView
     let player: AVPlayer
-    let loops: Bool
+    /// Plays left, this one included.
+    var plays: Int
     var endObserver: NSObjectProtocol?
 
-    init(id: String, view: AVPlayerView, player: AVPlayer, loops: Bool) {
+    init(id: String, view: AVPlayerView, player: AVPlayer, plays: Int) {
         self.id = id
         self.view = view
         self.player = player
-        self.loops = loops
+        self.plays = plays
     }
 }
 
@@ -135,7 +138,8 @@ extension ConversationViewController {
         v.setAccessibilityLabel(gif ? "GIF" : "Video")
         cell.addSubview(v)
         cell.playerView = v
-        let iv = InlineVideo(id: m.id, view: v, player: player, loops: gif)
+        // GIFs play twice and stop, as in WhatsApp; click again for more.
+        let iv = InlineVideo(id: m.id, view: v, player: player, plays: gif ? 2 : 1)
         let id = m.id
         iv.endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,
                                                                 object: player.currentItem, queue: .main) { [weak self] _ in
@@ -148,7 +152,8 @@ extension ConversationViewController {
 
     private func inlineVideoEnded(_ id: String) {
         guard let iv = inlineVideo, iv.id == id else { return }
-        if iv.loops {
+        iv.plays -= 1
+        if iv.plays > 0 {
             iv.player.seek(to: .zero)
             iv.player.play()
         } else {

@@ -46,7 +46,11 @@ func safeName(s string) string {
 
 // download fetches an attachment once and records its local path; the UI
 // picks it up from the row on the next refresh.
-func (a *App) download(chat, id string) {
+func (a *App) download(chat, id string) { a.downloadMedia(chat, id, false) }
+
+// downloadMedia downloads; with retry, media the server no longer has (old
+// history) is asked for again from the phone, as WhatsApp's companions do.
+func (a *App) downloadMedia(chat, id string, retry bool) {
 	key := chat + "/" + id
 	if _, busy := a.media.LoadOrStore(key, true); busy {
 		return
@@ -90,12 +94,16 @@ func (a *App) download(chat, id string) {
 		if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
 			strings.Contains(err.Error(), "status code 403") {
 			status = "expired"
+			if retry && a.requestMediaRetry(chat, id, mk) {
+				status = "retrying"
+			}
 		}
 		emit(map[string]any{"t": "media", "chat": chat, "id": id, "status": status})
 		return
 	}
 	a.db.Exec(`UPDATE messages SET media_path=? WHERE chat=? AND id=?`, path, chat, id)
 	a.touchMsg(chat, id)
+	emit(map[string]any{"t": "media", "chat": chat, "id": id, "status": "downloaded"})
 }
 
 // ---- avatars: fetched lazily for visible rows, one at a time, cached on disk ----
