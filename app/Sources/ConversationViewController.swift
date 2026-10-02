@@ -1044,6 +1044,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             res = Core.shared.call("send_image", ["chat": c.jid, "path": img.path, "thumb": img.thumb, "width": img.w, "height": img.h,
                                                   "mime": "image/jpeg", "text": trimmed, "quote": replyTo?.id ?? ""])
         } else {
+            let text = Prefs.emojiReplace ? Emoticons.replace(text) : text
             var args: [String: Any] = ["chat": c.jid, "text": text, "quote": replyTo?.id ?? ""]
             if let p = composer.linkPreview, text.contains(p.url.absoluteString) || WAText.firstURL(text) == p.url {
                 args["link_url"] = p.url.absoluteString
@@ -1057,6 +1058,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
             NSLog("send failed: %@", err)
             return
         }
+        if Prefs.outgoingSound { NSSound(named: "Pop")?.play() }
         composer.text = ""
         drafts[c.jid] = nil
         replyTo = nil

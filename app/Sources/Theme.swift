@@ -17,7 +17,14 @@ enum Theme {
         }
     }
 
-    static var canvas: NSColor { .textBackgroundColor }
+    /// The transcript canvas: the system text background, or the chosen wallpaper tone.
+    static let canvas = NSColor(name: "canvas") { @Sendable ap in
+        let dark = ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        if let w = Wallpaper.color(dark: dark) { return w }
+        var c = NSColor(hex: dark ? 0x1E1E1E : 0xFFFFFF)
+        ap.performAsCurrentDrawingAppearance { if let t = NSColor.textBackgroundColor.usingColorSpace(.sRGB) { c = t } }
+        return c
+    }
     /// Outgoing bubble follows the accent color (System Settings › Appearance; "Multicolor"
     /// means the app's AccentColor, WhatsApp green). On WhatsApp green it's WhatsApp's exact
     /// pair (pale green / deep green); any other accent gets the same lightness and relative
@@ -84,7 +91,7 @@ enum Theme {
         }
     }
 
-    static let accentDidChange = Notification.Name("WA.accentDidChange")
+    static let didChange = Notification.Name("WA.didChange")
     nonisolated private static let accentKey = "WA.accent"
 
     nonisolated static var accentChoice: AccentChoice {
@@ -99,7 +106,7 @@ enum Theme {
         } else {
             UserDefaults.standard.removeObject(forKey: "AppleAccentColor")
         }
-        NotificationCenter.default.post(name: accentDidChange, object: nil)
+        NotificationCenter.default.post(name: didChange, object: nil)
     }
 
     nonisolated private static func resolvedAccent(_ ap: NSAppearance) -> NSColor? {

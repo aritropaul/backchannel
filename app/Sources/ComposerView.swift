@@ -297,7 +297,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
         textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isContinuousSpellCheckingEnabled = true
+        textView.isContinuousSpellCheckingEnabled = Prefs.spellCheck
+        NotificationCenter.default.addObserver(forName: Prefs.changed, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.textView.isContinuousSpellCheckingEnabled = Prefs.spellCheck }
+        }
         textView.textContainerInset = NSSize(width: 0, height: 0)
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = true
@@ -534,11 +537,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
     func textView(_ textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         if sel == #selector(NSResponder.insertNewline(_:)) {
             let flags = NSApp.currentEvent?.modifierFlags ?? []
-            if flags.contains(.shift) || flags.contains(.option) {
-                textView.insertNewlineIgnoringFieldEditor(nil)
-            } else {
-                send()
-            }
+            // "Enter is send" (Settings › Chats): Return sends, Shift/Option-Return breaks the line.
+            // Off: Return breaks the line and ⌘-Return sends.
+            let sends = Prefs.enterSends ? !(flags.contains(.shift) || flags.contains(.option)) : flags.contains(.command)
+            if sends { send() } else { textView.insertNewlineIgnoringFieldEditor(nil) }
             return true
         }
         if sel == #selector(NSResponder.cancelOperation(_:)) {

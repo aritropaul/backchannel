@@ -3,6 +3,7 @@ import Foundation
 /// Mirrors the K* constants in core/db.go.
 enum MessageKind: Int, Sendable {
     case text, image, video, audio, voice, document, sticker, location, contact, poll, revoked, unsupported, pending
+    case notice   // a system line, e.g. "security code changed"
 
     var isVisual: Bool { self == .image || self == .video || self == .sticker }
 
@@ -19,7 +20,7 @@ enum MessageKind: Int, Sendable {
         case .poll: "Poll"
         case .revoked: "This message was deleted"
         case .pending: "Waiting for this message"
-        case .text, .unsupported: ""
+        case .text, .unsupported, .notice: ""
         }
     }
 

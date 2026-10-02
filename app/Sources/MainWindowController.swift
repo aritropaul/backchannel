@@ -81,7 +81,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             return self.convo.capsuleTakesClick(at: e.locationInWindow) ? nil : e
         }
         // Changing the accent (System Settings › Appearance) recolors the whole app, bubbles included.
-        for name in [NSColor.systemColorsDidChangeNotification, Theme.accentDidChange] {
+        for name in [NSColor.systemColorsDidChangeNotification, Theme.didChange] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, self.isShowingMain else { return }

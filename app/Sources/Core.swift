@@ -10,7 +10,7 @@ enum CoreEvent {
     case reload(chat: String)
     case typing(chat: String, sender: String, on: Bool)
     case presence(jid: String, online: Bool, lastSeen: Date?)
-    case notify(chat: String, id: String, title: String, body: String, muted: Bool)
+    case notify(chat: String, id: String, title: String, body: String, muted: Bool, reaction: Bool)
     case sync(progress: Int)
     case media(chat: String, id: String, status: String)
     case error(String)
@@ -128,7 +128,8 @@ final class Core {
             let ls = (o["last_seen"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
             event = .presence(jid: s("jid"), online: o["online"] as? Bool ?? false, lastSeen: ls)
         case "notify":
-            event = .notify(chat: s("chat"), id: s("id"), title: s("title"), body: s("body"), muted: o["muted"] as? Bool ?? false)
+            event = .notify(chat: s("chat"), id: s("id"), title: s("title"), body: s("body"), muted: o["muted"] as? Bool ?? false,
+                            reaction: o["reaction"] as? Bool ?? false)
         case "sync": event = .sync(progress: (o["progress"] as? Int) ?? Int(o["progress"] as? Double ?? 0))
         case "media": event = .media(chat: s("chat"), id: s("id"), status: s("status"))
         case "avatar": return // the core follows up with a "chats" event

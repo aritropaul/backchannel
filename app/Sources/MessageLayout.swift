@@ -100,7 +100,25 @@ final class MessageLayout {
         let emojiCount = msg.kind == .text && msg.quoteID.isEmpty ? WAText.emojiOnlyCount(msg.text) : 0
         let visual = msg.kind == .image || msg.kind == .video || msg.kind == .sticker || (msg.kind == .location && msg.thumb != nil)
 
-        if emojiCount > 0 {
+        if msg.kind == .notice {
+            // A centred system line with a lock, no bubble (security code changes).
+            let a = NSMutableAttributedString()
+            if let lock = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold).applying(.init(paletteColors: [Theme.meta]))) {
+                let att = NSTextAttachment()
+                att.image = lock
+                a.append(NSAttributedString(attachment: att))
+                a.append(NSAttributedString(string: " "))
+            }
+            a.append(NSAttributedString(string: msg.text, attributes: [.font: Theme.small, .foregroundColor: Theme.meta]))
+            let t = TextBlock(a, maxWidth: min(width - 120, 420))
+            text = t
+            textOrigin = CGPoint(x: (width - t.size.width) / 2, y: y + 4)
+            mediaRect = nil
+            bubble = nil
+            sender = nil
+            y += t.size.height + 8
+        } else if emojiCount > 0 {
             let size: CGFloat = [40, 34, 28][min(emojiCount, 3) - 1]
             let t = TextBlock(NSAttributedString(string: msg.text.trimmingCharacters(in: .whitespacesAndNewlines),
                                                  attributes: [.font: NSFont.systemFont(ofSize: size)]), maxWidth: maxBubble)
@@ -552,8 +570,15 @@ final class MessageLayout {
 
     // MARK: media
 
+    /// Media fetched as soon as it's on screen, per Settings › Chats › Media auto-download.
     var wantsAutoDownload: Bool {
-        (msg.kind == .image || msg.kind == .sticker || msg.kind == .voice) && msg.hasMedia && msg.mediaPath.isEmpty
+        guard msg.hasMedia, msg.mediaPath.isEmpty else { return false }
+        switch msg.kind {
+        case .image, .sticker: return Prefs.autoPhotos
+        case .voice, .audio: return Prefs.autoAudio
+        case .document: return Prefs.autoDocuments
+        default: return false
+        }
     }
 
     /// Full image if decoded, else the inline thumbnail. Kicks off decoding once.

@@ -3,11 +3,12 @@ import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var wc: MainWindowController?
-    private lazy var settings = SettingsWindowController()
+    private var settings: SettingsWindowController?
     private var store: Store?
     private var badgeScheduled = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Prefs.applyTheme()
         buildMenu()
         let core = Core.shared
         core.start()
@@ -21,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         self.store = store
         Avatars.shared.store = store
+        NotificationCenter.default.addObserver(forName: Prefs.changed, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateBadge() }
+        }
         let main = MainWindowController(store: store)
         self.wc = main
         core.observe { [weak self] e in self?.handle(e) }
@@ -60,7 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.convo.playLatestVideo() }
         }
         if env["WA_PREVIEW_SETTINGS"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showSettings(nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.showSettings(nil)
+                if let s = env["WA_SETTINGS_SECTION"].flatMap(SettingsSection.init) { self?.settings?.show(s) }
+            }
         }
         if env["WA_TEST_NOTIFY"] != nil {
             // Verifies notifications end to end: logs the permission, posts one, then logs what macOS delivered.
@@ -120,8 +127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         switch e {
         case .chats, .reload:
             scheduleBadge()
-        case .notify(let chat, _, let title, let body, let muted):
-            notify(chat: chat, title: title, body: body, muted: muted)
+        case .notify(let chat, _, let title, let body, let muted, let reaction):
+            notify(chat: chat, title: title, body: body, muted: muted, reaction: reaction)
         case .state(let s, _, _):
             if s == "syncing" { requestNotifications() }
             if s == "connected" { focusChanged() }
@@ -141,21 +148,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func updateBadge() {
-        let n = store?.unreadChatCount() ?? 0
+        let n = Prefs.badge ? (store?.unreadChatCount() ?? 0) : 0
         NSApp.dockTile.badgeLabel = n > 0 ? "\(n)" : nil
     }
 
     // MARK: notifications
 
-    private func notify(chat: String, title: String, body: String, muted: Bool) {
+    private func notify(chat: String, title: String, body: String, muted: Bool, reaction: Bool) {
         guard !muted else { return }
         if NSApp.isActive, wc?.convo.chat?.jid == chat { return }
+        // Settings › Notifications: per-kind switches, previews, sound.
+        let group = chat.hasSuffix("@g.us")
+        guard group ? Prefs.notifyGroups : Prefs.notifyMessages else { return }
+        if reaction, !(group ? Prefs.notifyGroupReactions : Prefs.notifyReactions) { return }
         let content = UNMutableNotificationContent()
         content.title = title
-        content.body = body
+        content.body = Prefs.notifyPreviews ? body : "New message"
         content.threadIdentifier = chat
         content.userInfo = ["chat": chat]
-        content.sound = .default
+        switch Prefs.notifySound {
+        case "default": content.sound = .default
+        case "none": content.sound = nil
+        case let name:
+            content.sound = nil
+            NSSound(named: NSSound.Name(name))?.play()
+        }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }
@@ -178,7 +195,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: menu actions
 
     @objc func newMessage(_ sender: Any?) { wc?.newMessage(sender) }
-    @objc func showSettings(_ sender: Any?) { settings.showWindow(sender) }
+    @objc func showSettings(_ sender: Any?) {
+        guard let store else { return }
+        if settings == nil { settings = SettingsWindowController(store: store) }
+        settings?.showWindow(sender)
+        settings?.window?.makeKeyAndOrderFront(sender)
+    }
     @objc func nextChat(_ sender: Any?) { wc?.list.selectRelative(1) }
     @objc func previousChat(_ sender: Any?) { wc?.list.selectRelative(-1) }
     @objc func searchChats(_ sender: Any?) { wc?.list.focusSearch() }

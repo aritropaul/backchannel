@@ -197,7 +197,7 @@ extension ConversationViewController {
               let jid = chat?.jid else { return }
         thumbRequested.insert(m.id)
         Core.shared.call("thumb", ["chat": jid, "id": m.id])
-        if m.kind == .video, m.mediaPath.isEmpty {
+        if m.kind == .video, m.mediaPath.isEmpty, Prefs.autoVideoPosters {
             posterQueue.append((jid, m.id))
             pumpPosters()
         }

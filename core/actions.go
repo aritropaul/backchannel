@@ -44,6 +44,7 @@ type req struct {
 	LinkDesc  string `json:"link_desc"`
 	Name      string `json:"name"`  // file name shown to the recipient
 	Bytes     int    `json:"bytes"` // video_prefix: how much of the file to fetch
+	Value     string `json:"value"` // set_privacy: the setting's new value
 }
 
 func call(raw []byte) (out any) {
@@ -83,6 +84,30 @@ func call(raw []byte) (out any) {
 		res, err = a.videoPrefix(r.Chat, r.ID, r.Bytes)
 	case "set_thumb":
 		err = a.setThumb(r.Chat, r.ID, r.Thumb)
+	case "my_profile":
+		res, err = a.myProfile()
+	case "set_name":
+		err = a.setName(strings.TrimSpace(r.Text))
+	case "set_about":
+		err = a.setAbout(strings.TrimSpace(r.Text))
+	case "set_photo":
+		res, err = a.setPhoto(r.Path)
+	case "privacy":
+		res, err = a.privacy()
+	case "set_privacy":
+		err = a.setPrivacy(r.Name, r.Value)
+	case "set_default_timer":
+		err = a.setDefaultTimer(r.Seconds)
+	case "blocklist":
+		res, err = a.blocklist()
+	case "block":
+		err = a.block(r.Chat, r.On)
+	case "devices":
+		res, err = a.devices()
+	case "archive_all":
+		res, err = a.archiveAll()
+	case "security_notices":
+		a.setSecurityNotices(r.On)
 	case "set_waveform":
 		err = a.setWaveform(r.Chat, r.ID, r.Wave)
 	case "react":

@@ -21,6 +21,7 @@ const (
 	KRevoked
 	KUnsupported
 	KPending // undecryptable, waiting for retry
+	KNotice  // a system line in the chat, e.g. "security code changed"
 )
 
 // Outgoing status. Mirrored in Swift (MessageStatus).

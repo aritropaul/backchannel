@@ -33,6 +33,8 @@ func (a *App) handle(evt any) {
 		a.onReceipt(e)
 	case groupSize:
 		a.setGroupSize(e.chat, e.n)
+	case *events.IdentityChange:
+		a.onIdentityChange(e)
 	case *events.ChatPresence:
 		chat := a.canon(e.Chat)
 		emit(map[string]any{"t": "typing", "chat": chat.String(), "sender": a.canon(e.Sender).String(),
@@ -212,6 +214,9 @@ func (a *App) onMessage(e *events.Message, live bool) {
 	}
 	if rm := m.GetReactionMessage(); rm != nil {
 		a.onReaction(r.Chat, rm.GetKey().GetID(), r.Sender, rm.GetText(), r.TS)
+		if live && !r.FromMe && rm.GetText() != "" {
+			a.notifyReaction(r, chat, rm.GetKey().GetID(), rm.GetText())
+		}
 		return
 	}
 	if e.IsEdit {
@@ -742,6 +747,30 @@ func (a *App) nameFor(j types.JID) string {
 		return "+" + j.User
 	}
 	return ""
+}
+
+// notifyReaction tells the owner someone reacted to one of their messages
+// (shown only if "Reaction notifications" is on in the app's settings).
+func (a *App) notifyReaction(r *msgRow, chat types.JID, target, emoji string) {
+	var fromMe, kind int
+	var text, fileName string
+	if a.rdb.QueryRow(`SELECT from_me, kind, text, file_name FROM messages WHERE chat=? AND id=?`, r.Chat, target).
+		Scan(&fromMe, &kind, &text, &fileName) != nil || fromMe != 1 {
+		return
+	}
+	var muted int64
+	a.rdb.QueryRow(`SELECT muted_until FROM chats WHERE jid=?`, r.Chat).Scan(&muted)
+	sj, _ := types.ParseJID(r.Sender)
+	who := a.nameFor(sj)
+	if who == "" {
+		who = r.PushName
+	}
+	body := "Reacted " + emoji + " to “" + previewText(&msgRow{Kind: kind, Text: text, FileName: fileName}) + "”"
+	if chat.Server == types.GroupServer && who != "" {
+		body = strings.TrimSpace(who) + " reacted " + emoji + " to “" + previewText(&msgRow{Kind: kind, Text: text, FileName: fileName}) + "”"
+	}
+	emit(map[string]any{"t": "notify", "chat": r.Chat, "id": "reaction-" + r.ID, "title": a.nameFor(chat), "body": body,
+		"muted": muted == -1 || muted > time.Now().Unix(), "reaction": true})
 }
 
 func (a *App) notify(r *msgRow, chat types.JID) {
