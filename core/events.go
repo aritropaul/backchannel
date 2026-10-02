@@ -1,0 +1,630 @@
+package main
+
+import (
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+)
+
+// loop applies events strictly in arrival order on one goroutine so the
+// database always reflects a consistent prefix of what the server sent.
+func (a *App) loop() {
+	for evt := range a.events {
+		a.handle(evt)
+	}
+}
+
+func (a *App) handle(evt any) {
+	switch e := evt.(type) {
+	case *events.Message:
+		a.onMessage(e, true)
+	case *events.UndecryptableMessage:
+		a.onUndecryptable(e)
+	case *events.HistorySync:
+		a.onHistory(e)
+	case *events.Receipt:
+		a.onReceipt(e)
+	case *events.ChatPresence:
+		chat := a.canon(e.Chat)
+		emit(map[string]any{"t": "typing", "chat": chat.String(), "sender": a.canon(e.Sender).String(),
+			"on": e.State == types.ChatPresenceComposing, "audio": e.Media == types.ChatPresenceMediaAudio})
+	case *events.Presence:
+		ev := map[string]any{"t": "presence", "jid": a.canon(e.From).String(), "online": !e.Unavailable}
+		if !e.LastSeen.IsZero() {
+			ev["last_seen"] = e.LastSeen.UnixMilli()
+		}
+		emit(ev)
+	case *events.PushName:
+		a.setPushName(a.canon(e.JID), e.NewPushName)
+	case *events.Contact:
+		name := e.Action.GetFullName()
+		if name == "" {
+			name = e.Action.GetFirstName()
+		}
+		a.db.Exec(`INSERT INTO contacts (jid, name) VALUES (?,?) ON CONFLICT(jid) DO UPDATE SET name=excluded.name`,
+			a.canon(e.JID).String(), name)
+		a.touchChats()
+	case *events.Pin:
+		pinned := int64(0)
+		if e.Action.GetPinned() {
+			pinned = e.Timestamp.Unix()
+		}
+		a.setChatField(e.JID, "pinned", pinned)
+	case *events.Archive:
+		a.setChatField(e.JID, "archived", b2i(e.Action.GetArchived()))
+	case *events.Mute:
+		until := int64(0)
+		if e.Action.GetMuted() {
+			until = e.Action.GetMuteEndTimestamp()
+			if until <= 0 {
+				until = -1
+			} else if until > 1e12 { // some clients send ms
+				until /= 1000
+			}
+		}
+		a.setChatField(e.JID, "muted_until", until)
+	case *events.MarkChatAsRead:
+		chat := a.canon(e.JID).String()
+		if e.Action.GetRead() {
+			a.db.Exec(`UPDATE chats SET unread=0, marked_unread=0 WHERE jid=?`, chat)
+		} else {
+			a.db.Exec(`UPDATE chats SET marked_unread=1 WHERE jid=?`, chat)
+		}
+		a.touchChats()
+	case *events.DeleteChat:
+		chat := a.canon(e.JID).String()
+		a.db.Exec(`DELETE FROM messages WHERE chat=?`, chat)
+		a.db.Exec(`DELETE FROM chats WHERE jid=?`, chat)
+		a.touchReload(chat)
+	case *events.ClearChat:
+		chat := a.canon(e.JID).String()
+		a.db.Exec(`DELETE FROM messages WHERE chat=?`, chat)
+		a.db.Exec(`UPDATE chats SET last_id='' WHERE jid=?`, chat)
+		a.touchReload(chat)
+	case *events.GroupInfo:
+		if e.Name != nil && e.Name.Name != "" {
+			a.db.Exec(`INSERT INTO chats (jid, name, is_group) VALUES (?,?,1) ON CONFLICT(jid) DO UPDATE SET name=excluded.name`,
+				e.JID.String(), e.Name.Name)
+			a.touchChats()
+		}
+	case *events.JoinedGroup:
+		a.db.Exec(`INSERT INTO chats (jid, name, is_group, last_ts) VALUES (?,?,1,?) ON CONFLICT(jid) DO UPDATE SET name=excluded.name`,
+			e.JID.String(), e.GroupName.Name, time.Now().UnixMilli())
+		a.touchChats()
+	case *events.Picture:
+		chat := a.canon(e.JID).String()
+		a.db.Exec(`UPDATE chats SET avatar='', avatar_ts=0 WHERE jid=?`, chat)
+		a.avatarSeen.Delete(chat)
+		a.touchChats()
+	case *events.AppStateSyncComplete:
+		a.importContacts()
+	case *events.PairSuccess:
+		emit(map[string]any{"t": "state", "s": "syncing", "me": e.ID.ToNonAD().String()})
+	case *events.Connected:
+		emit(map[string]any{"t": "state", "s": "connected", "me": a.me().String()})
+		go a.afterConnect()
+	case *events.Disconnected:
+		emit(map[string]any{"t": "state", "s": "connecting"})
+	case *events.KeepAliveTimeout:
+		emit(map[string]any{"t": "state", "s": "connecting"})
+	case *events.KeepAliveRestored:
+		emit(map[string]any{"t": "state", "s": "connected", "me": a.me().String()})
+	case *events.StreamReplaced:
+		emit(map[string]any{"t": "state", "s": "replaced"})
+	case *events.LoggedOut:
+		a.wipeAppDB()
+		emit(map[string]any{"t": "state", "s": "logged_out"})
+		a.restartPairing()
+	case *events.TemporaryBan:
+		emit(map[string]any{"t": "state", "s": "banned", "msg": e.String()})
+	}
+}
+
+func (a *App) setChatField(j types.JID, col string, v any) {
+	chat := a.canon(j)
+	ensureChat(a.db, chat.String(), chat.Server == types.GroupServer)
+	a.db.Exec(`UPDATE chats SET `+col+`=? WHERE jid=?`, v, chat.String())
+	a.touchChats()
+}
+
+func (a *App) afterConnect() {
+	if a.synced.Swap(true) {
+		return
+	}
+	a.importContacts()
+	if groups, err := a.cli.GetJoinedGroups(a.ctx); err == nil {
+		tx, err := a.db.Begin()
+		if err == nil {
+			for _, g := range groups {
+				tx.Exec(`INSERT INTO chats (jid, name, is_group) VALUES (?,?,1) ON CONFLICT(jid) DO UPDATE SET name=excluded.name, is_group=1`,
+					g.JID.String(), g.Name)
+			}
+			tx.Commit()
+		}
+		a.touchChats()
+	}
+	a.mergeLIDChats()
+	if a.appActive.Load() {
+		a.cli.SendPresence(a.ctx, types.PresenceAvailable)
+	}
+}
+
+// ---- messages ----
+
+func (a *App) rowFor(info *types.MessageInfo) (*msgRow, types.JID, bool) {
+	chat := a.canon(info.Chat)
+	if skipChat(chat) {
+		return nil, chat, false
+	}
+	sender := a.canon(info.Sender)
+	return &msgRow{
+		Chat:     chat.String(),
+		ID:       info.ID,
+		Sender:   sender.String(),
+		PushName: info.PushName,
+		FromMe:   info.IsFromMe,
+		TS:       info.Timestamp.UnixMilli(),
+	}, chat, true
+}
+
+func (a *App) onMessage(e *events.Message, live bool) {
+	r, chat, ok := a.rowFor(&e.Info)
+	if !ok {
+		return
+	}
+	m := e.Message
+	if pm := m.GetProtocolMessage(); pm != nil {
+		target := pm.GetKey().GetID()
+		switch pm.GetType() {
+		case waE2E.ProtocolMessage_REVOKE:
+			a.db.Exec(`UPDATE messages SET kind=?, text='', media='', thumb=NULL, quote_id='', reactions='' WHERE chat=? AND id=?`,
+				KRevoked, r.Chat, target)
+			a.touchMsg(r.Chat, target)
+		case waE2E.ProtocolMessage_MESSAGE_EDIT:
+			var nr msgRow
+			if a.content(pm.GetEditedMessage(), &nr) {
+				a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`, nr.Text, r.Chat, target, KRevoked)
+				a.touchMsg(r.Chat, target)
+			}
+		}
+		return
+	}
+	if rm := m.GetReactionMessage(); rm != nil {
+		a.onReaction(r.Chat, rm.GetKey().GetID(), r.Sender, rm.GetText(), r.TS)
+		return
+	}
+	if e.IsEdit {
+		// History sync delivers edits already unwrapped onto the original ID.
+		var nr msgRow
+		if a.content(m, &nr) {
+			a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, nr.Text, r.Chat, r.ID)
+			a.touchMsg(r.Chat, r.ID)
+		}
+		return
+	}
+	if !a.content(m, r) {
+		return
+	}
+	if r.FromMe {
+		r.Status = StSent
+		if e.SourceWebMsg != nil {
+			r.Status = webStatus(e.SourceWebMsg.GetStatus())
+		}
+	}
+	if !r.FromMe && r.PushName != "" {
+		a.setPushName(a.canon(e.Info.Sender), r.PushName)
+	}
+	if err := upsertMessage(a.db, r); err != nil {
+		a.log.Errorf("insert %s/%s: %v", r.Chat, r.ID, err)
+		return
+	}
+	a.statMsgs.Add(1)
+	bumpChat(a.db, r.Chat, chat.Server == types.GroupServer, r.TS, r.ID)
+	a.touchMsg(r.Chat, r.ID)
+	if !live {
+		return
+	}
+	if r.FromMe {
+		// Sent from the phone: WhatsApp treats that as having read the chat.
+		a.db.Exec(`UPDATE chats SET unread=0, marked_unread=0 WHERE jid=?`, r.Chat)
+		return
+	}
+	if a.appActive.Load() && a.activeChat.Load().(string) == r.Chat {
+		a.cli.MarkRead(a.ctx, []types.MessageID{r.ID}, time.Now(), chat, e.Info.Sender)
+		return
+	}
+	a.db.Exec(`UPDATE chats SET unread=unread+1 WHERE jid=?`, r.Chat)
+	a.notify(r, chat)
+}
+
+func (a *App) onUndecryptable(e *events.UndecryptableMessage) {
+	r, chat, ok := a.rowFor(&e.Info)
+	if !ok {
+		return
+	}
+	if e.IsUnavailable && e.UnavailableType == events.UnavailableTypeViewOnce {
+		r.Kind, r.Text = KUnsupported, "View once message. Open it on your phone."
+	} else {
+		r.Kind, r.Text = KPending, "Waiting for this message. This may take a while."
+	}
+	a.db.Exec(`INSERT INTO messages (chat, id, sender, push_name, from_me, ts, kind, text) VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(chat, id) DO NOTHING`, r.Chat, r.ID, r.Sender, r.PushName, b2i(r.FromMe), r.TS, r.Kind, r.Text)
+	bumpChat(a.db, r.Chat, chat.Server == types.GroupServer, r.TS, r.ID)
+	a.touchMsg(r.Chat, r.ID)
+}
+
+func (a *App) onReaction(chat, msgID, sender, emoji string, ts int64) {
+	if emoji == "" {
+		a.db.Exec(`DELETE FROM reactions WHERE chat=? AND msg_id=? AND sender=?`, chat, msgID, sender)
+	} else {
+		a.db.Exec(`INSERT INTO reactions (chat, msg_id, sender, emoji, ts) VALUES (?,?,?,?,?)
+			ON CONFLICT(chat, msg_id, sender) DO UPDATE SET emoji=excluded.emoji, ts=excluded.ts`, chat, msgID, sender, emoji, ts)
+	}
+	refreshReactions(a.db, chat, msgID, a.me().String())
+	a.touchMsg(chat, msgID)
+}
+
+func webStatus(s waWeb.WebMessageInfo_Status) int {
+	switch s {
+	case waWeb.WebMessageInfo_ERROR:
+		return StFailed
+	case waWeb.WebMessageInfo_PENDING:
+		return StPending
+	case waWeb.WebMessageInfo_DELIVERY_ACK:
+		return StDelivered
+	case waWeb.WebMessageInfo_READ:
+		return StRead
+	case waWeb.WebMessageInfo_PLAYED:
+		return StPlayed
+	}
+	return StSent
+}
+
+func (a *App) onReceipt(e *events.Receipt) {
+	chat := a.canon(e.Chat).String()
+	var st int
+	switch e.Type {
+	case types.ReceiptTypeDelivered:
+		st = StDelivered
+	case types.ReceiptTypeRead:
+		st = StRead
+	case types.ReceiptTypePlayed:
+		st = StPlayed
+	case types.ReceiptTypeReadSelf, types.ReceiptTypePlayedSelf:
+		// Read on another of my devices.
+		a.db.Exec(`UPDATE chats SET unread=0, marked_unread=0 WHERE jid=?`, chat)
+		a.touchChats()
+		return
+	default:
+		return
+	}
+	if !e.IsFromMe {
+		for _, id := range e.MessageIDs {
+			a.db.Exec(`UPDATE messages SET status=? WHERE chat=? AND id=? AND from_me=1 AND status < ? AND status >= 0`, st, chat, id, st)
+			a.touchMsg(chat, id)
+		}
+	}
+}
+
+// ---- history sync ----
+
+func (a *App) onHistory(e *events.HistorySync) {
+	d := e.Data
+	switch d.GetSyncType() {
+	case waHistorySync.HistorySync_PUSH_NAME:
+		tx, err := a.db.Begin()
+		if err != nil {
+			return
+		}
+		for _, p := range d.GetPushnames() {
+			if p.GetPushname() == "" || p.GetPushname() == "-" {
+				continue
+			}
+			if j, err := types.ParseJID(p.GetID()); err == nil {
+				tx.Exec(`INSERT INTO contacts (jid, push_name) VALUES (?,?) ON CONFLICT(jid) DO UPDATE SET push_name=excluded.push_name`,
+					a.canon(j).String(), p.GetPushname())
+			}
+		}
+		tx.Commit()
+		a.touchChats()
+		return
+	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT,
+		waHistorySync.HistorySync_FULL, waHistorySync.HistorySync_ON_DEMAND:
+	default:
+		return
+	}
+	t0 := time.Now()
+	before := a.statMsgs.Load()
+	for _, conv := range d.GetConversations() {
+		a.importConversation(conv, d.GetSyncType())
+	}
+	a.log.Infof("history %s chunk=%d progress=%d%%: %d conversations, %d messages in %s (queue %d)",
+		d.GetSyncType(), d.GetChunkOrder(), d.GetProgress(), len(d.GetConversations()),
+		a.statMsgs.Load()-before, time.Since(t0).Round(time.Millisecond), len(a.events))
+	emit(map[string]any{"t": "sync", "progress": d.GetProgress(), "type": d.GetSyncType().String()})
+	a.mergeLIDChats()
+}
+
+func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistorySync.HistorySync_HistorySyncType) {
+	raw, err := types.ParseJID(conv.GetID())
+	if err != nil {
+		return
+	}
+	chat := a.canon(raw)
+	if skipChat(chat) {
+		return
+	}
+	isGroup := chat.Server == types.GroupServer
+	tx, err := a.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	name := conv.GetName()
+	if name == "" && isGroup {
+		name = conv.GetDisplayName()
+	}
+	ts := int64(conv.GetConversationTimestamp())
+	if ts == 0 {
+		ts = int64(conv.GetLastMsgTimestamp())
+	}
+	pinned := int64(0)
+	if conv.GetPinned() != 0 {
+		pinned = int64(conv.GetPinned())
+	}
+	muted := int64(conv.GetMuteEndTime())
+	if muted > 1e12 {
+		muted /= 1000
+	}
+	// History is a snapshot; live app-state events are authoritative, so only
+	// seed metadata for chats we haven't seen, and never move counts backwards
+	// on later chunks of the same chat.
+	tx.Exec(`INSERT INTO chats (jid, name, is_group, last_ts, unread, marked_unread, pinned, archived, muted_until)
+		VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name=CASE WHEN excluded.name != '' THEN excluded.name ELSE chats.name END,
+			is_group=excluded.is_group`,
+		chat.String(), name, b2i(isGroup), ts*1000, conv.GetUnreadCount(), b2i(conv.GetMarkedAsUnread()),
+		pinned, b2i(conv.GetArchived()), muted)
+
+	msgs := conv.GetMessages() // newest first
+	for i := len(msgs) - 1; i >= 0; i-- {
+		wm := msgs[i].GetMessage()
+		if wm == nil || wm.GetMessage() == nil {
+			continue
+		}
+		evt, err := a.cli.ParseWebMessage(chat, wm)
+		if err != nil {
+			continue
+		}
+		r, _, ok := a.rowFor(&evt.Info)
+		if !ok {
+			continue
+		}
+		r.Chat = chat.String()
+		m := evt.Message
+		if pm := m.GetProtocolMessage(); pm != nil {
+			if pm.GetType() == waE2E.ProtocolMessage_REVOKE {
+				tx.Exec(`UPDATE messages SET kind=?, text='', media='', thumb=NULL WHERE chat=? AND id=?`, KRevoked, r.Chat, pm.GetKey().GetID())
+			}
+			continue
+		}
+		if rm := m.GetReactionMessage(); rm != nil {
+			continue // reactions in history arrive on the target message itself
+		}
+		if evt.IsEdit || isEditProto(evt.RawMessage) {
+			var nr msgRow
+			if a.content(m, &nr) {
+				tx.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, nr.Text, r.Chat, r.ID)
+			}
+			continue
+		}
+		if wm.GetMessageStubType() == waWeb.WebMessageInfo_REVOKE {
+			r.Kind = KRevoked
+		} else if !a.content(m, r) {
+			continue
+		}
+		if r.FromMe {
+			r.Status = webStatus(wm.GetStatus())
+		}
+		if err := upsertMessage(tx, r); err != nil {
+			continue
+		}
+		a.statMsgs.Add(1)
+		for _, rc := range wm.GetReactions() {
+			sj, err := types.ParseJID(rc.GetKey().GetParticipant())
+			if err != nil || rc.GetKey().GetFromMe() {
+				sj = a.me()
+			}
+			tx.Exec(`INSERT INTO reactions (chat, msg_id, sender, emoji, ts) VALUES (?,?,?,?,?)
+				ON CONFLICT(chat, msg_id, sender) DO UPDATE SET emoji=excluded.emoji`,
+				r.Chat, r.ID, a.canon(sj).String(), rc.GetText(), rc.GetSenderTimestampMS())
+		}
+		if len(wm.GetReactions()) > 0 {
+			refreshReactions(tx, r.Chat, r.ID, a.me().String())
+		}
+		bumpChat(tx, r.Chat, isGroup, r.TS, r.ID)
+	}
+	if err := tx.Commit(); err != nil {
+		a.log.Errorf("history commit %s: %v", chat, err)
+		return
+	}
+	a.statConvs.Add(1)
+	if typ == waHistorySync.HistorySync_ON_DEMAND || len(msgs) > 0 {
+		a.touchReload(chat.String())
+	} else {
+		a.touchChats()
+	}
+}
+
+func isEditProto(m *waE2E.Message) bool {
+	return m.GetProtocolMessage().GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT
+}
+
+// ---- identity merging ----
+
+// mergeLIDChats folds chats keyed by a LID into the phone-number chat once
+// the mapping is known, so one person never shows up twice.
+func (a *App) mergeLIDChats() {
+	rows, err := a.rdb.Query(`SELECT jid FROM chats WHERE jid LIKE '%@lid'`)
+	if err != nil {
+		return
+	}
+	var lids []string
+	for rows.Next() {
+		var s string
+		if rows.Scan(&s) == nil {
+			lids = append(lids, s)
+		}
+	}
+	rows.Close()
+	merged := false
+	for _, s := range lids {
+		lid, err := types.ParseJID(s)
+		if err != nil {
+			continue
+		}
+		pn := a.canon(lid)
+		if pn.Server == types.HiddenUserServer {
+			continue
+		}
+		if err := a.mergeChat(s, pn.String()); err == nil {
+			merged = true
+		}
+	}
+	if merged {
+		a.touchAll()
+	}
+}
+
+func (a *App) mergeChat(from, to string) error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	tx.Exec(`UPDATE OR IGNORE messages SET chat=? WHERE chat=?`, to, from)
+	tx.Exec(`DELETE FROM messages WHERE chat=?`, from)
+	tx.Exec(`UPDATE OR IGNORE reactions SET chat=? WHERE chat=?`, to, from)
+	var c struct {
+		name                          string
+		lastTS                        int64
+		lastID                        string
+		unread, marked, pinned, arch  int64
+		muted                         int64
+	}
+	err = tx.QueryRow(`SELECT name, last_ts, last_id, unread, marked_unread, pinned, archived, muted_until FROM chats WHERE jid=?`, from).
+		Scan(&c.name, &c.lastTS, &c.lastID, &c.unread, &c.marked, &c.pinned, &c.arch, &c.muted)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	tx.Exec(`INSERT INTO chats (jid, name, last_ts, last_id, unread, marked_unread, pinned, archived, muted_until)
+		VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(jid) DO UPDATE SET
+			last_id=CASE WHEN excluded.last_ts > chats.last_ts THEN excluded.last_id ELSE chats.last_id END,
+			last_ts=MAX(chats.last_ts, excluded.last_ts),
+			unread=chats.unread + excluded.unread,
+			marked_unread=MAX(chats.marked_unread, excluded.marked_unread),
+			pinned=MAX(chats.pinned, excluded.pinned)`,
+		to, c.name, c.lastTS, c.lastID, c.unread, c.marked, c.pinned, c.arch, c.muted)
+	tx.Exec(`DELETE FROM chats WHERE jid=?`, from)
+	tx.Exec(`INSERT INTO contacts (jid, push_name) SELECT ?, push_name FROM contacts WHERE jid=? AND push_name != ''
+		ON CONFLICT(jid) DO UPDATE SET push_name=CASE WHEN contacts.push_name = '' THEN excluded.push_name ELSE contacts.push_name END`, to, from)
+	return tx.Commit()
+}
+
+// ---- names ----
+
+func (a *App) setPushName(j types.JID, name string) {
+	if name == "" || name == "-" {
+		return
+	}
+	key := j.String()
+	a.pushMu.Lock()
+	same := a.pushSeen[key] == name
+	a.pushSeen[key] = name
+	a.pushMu.Unlock()
+	if same {
+		return
+	}
+	a.db.Exec(`INSERT INTO contacts (jid, push_name) VALUES (?,?) ON CONFLICT(jid) DO UPDATE SET push_name=excluded.push_name`, key, name)
+	a.touchChats()
+}
+
+func (a *App) importContacts() {
+	if a.cli == nil {
+		return
+	}
+	all, err := a.cli.Store.Contacts.GetAllContacts(a.ctx)
+	if err != nil {
+		return
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		return
+	}
+	for j, c := range all {
+		name := c.FullName
+		if name == "" {
+			name = c.FirstName
+		}
+		if name == "" {
+			name = c.BusinessName
+		}
+		tx.Exec(`INSERT INTO contacts (jid, name, push_name) VALUES (?,?,?) ON CONFLICT(jid) DO UPDATE SET
+			name=CASE WHEN excluded.name != '' THEN excluded.name ELSE contacts.name END,
+			push_name=CASE WHEN excluded.push_name != '' THEN excluded.push_name ELSE contacts.push_name END`,
+			a.canon(j).String(), name, c.PushName)
+	}
+	tx.Commit()
+	a.touchChats()
+}
+
+// nameFor resolves a display name: saved contact > push name > group name > +number.
+func (a *App) nameFor(j types.JID) string {
+	var name, push string
+	a.rdb.QueryRow(`SELECT name, push_name FROM contacts WHERE jid=?`, j.String()).Scan(&name, &push)
+	if name != "" {
+		return name
+	}
+	if push != "" {
+		return push
+	}
+	if j.Server == types.GroupServer {
+		a.rdb.QueryRow(`SELECT name FROM chats WHERE jid=?`, j.String()).Scan(&name)
+		if name != "" {
+			return name
+		}
+	}
+	if j.Server == types.DefaultUserServer {
+		return "+" + j.User
+	}
+	return ""
+}
+
+func (a *App) notify(r *msgRow, chat types.JID) {
+	var muted int64
+	a.rdb.QueryRow(`SELECT muted_until FROM chats WHERE jid=?`, r.Chat).Scan(&muted)
+	isMuted := muted == -1 || muted > time.Now().Unix()
+	title := a.nameFor(chat)
+	body := previewText(r)
+	if chat.Server == types.GroupServer {
+		sj, _ := types.ParseJID(r.Sender)
+		sender := a.nameFor(sj)
+		if sender == "" {
+			sender = r.PushName
+		}
+		if sender != "" {
+			body = strings.TrimSpace(sender) + ": " + body
+		}
+	}
+	emit(map[string]any{"t": "notify", "chat": r.Chat, "id": r.ID, "title": title, "body": body, "muted": isMuted})
+}
