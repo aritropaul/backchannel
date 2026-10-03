@@ -29,6 +29,13 @@ final class SidebarRowView: NSTableRowView {
     }
 }
 
+/// The chat list's scroll view, without responsive scrolling. That tracks a trackpad
+/// gesture off the main event path, so the window's scroll monitor saw only its first
+/// event and never the lift that reveals Archived (`trackPull`).
+private final class ChatListScrollView: NSScrollView {
+    override class var isCompatibleWithResponsiveScrolling: Bool { false }
+}
+
 final class ChatListViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate, NSSearchFieldDelegate {
     enum Item {
         case pinned([Chat])
@@ -65,12 +72,14 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     static let fullMinWidth: CGFloat = 280
     /// Below this width the list draws as the compact column.
     private static let compactBelow: CGFloat = (compactWidth + fullMinWidth) / 2
-    /// How far past the top a pull has to go before letting go shows Archived.
-    private static let pullThreshold: CGFloat = 56
+    /// How far the fingers have to travel down past the top before letting go shows Archived.
+    private static let pullTravel: CGFloat = 240
     private(set) var compact = false
     /// Archived stays out of the list until a deliberate pull down past its top.
     private var archiveRevealed = false
     private var pullArmed = false
+    /// Finger travel past the top in the current gesture; nil when it didn't start at the top.
+    private var pullDistance: CGFloat?
     private var fullTop: NSLayoutConstraint!
     private var compactTop: NSLayoutConstraint!
     private var scrollMonitor: Any?
@@ -108,7 +117,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     private let search = NSSearchField()
     private let filters = GlassSegmentedControl(labels: ["All", "Unread", "Groups"])
     private let status = NSTextField(labelWithString: "")
-    private let scrollView = NSScrollView()
+    private let scrollView: NSScrollView = ChatListScrollView()
     let tableView = NSTableView()
     private let pinnedGrid = PinnedGridView()
 
@@ -254,29 +263,43 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
 
     // MARK: pull for Archived
 
-    /// Pulling past the top with fingers still on the trackpad arms the reveal, with a
-    /// haptic tick; letting go shows Archived. Momentum bounces never count, so a fling
-    /// to the top doesn't open it by accident.
+    /// Pulling down past the top with fingers still on the trackpad arms the reveal, with a
+    /// haptic tick; letting go shows Archived, and pushing back before that disarms it. The
+    /// pull is the fingers' travel, not how far the list stretches: the rubber band stiffens
+    /// so fast that one deliberate pull stretches it only 15–40pt. Only a gesture that
+    /// starts at the top counts and momentum never does, so scrolling or flinging up to the
+    /// top doesn't open it by accident.
     private func trackPull(_ e: NSEvent) {
         guard e.window === view.window, !archiveRevealed, !showingArchived, !showingLocked, isPlain,
               scrollView.bounds.contains(scrollView.convert(e.locationInWindow, from: nil)) else {
             pullArmed = false
+            pullDistance = nil
             return
         }
+        let atTop = scrollView.contentView.bounds.minY <= -scrollView.contentInsets.top + 1
         switch e.phase {
-        case .began, .cancelled:
+        case .began:
             pullArmed = false
+            pullDistance = atTop ? 0 : nil
         case .changed:
-            let top = -scrollView.contentInsets.top
-            if !pullArmed, scrollView.contentView.bounds.minY < top - Self.pullThreshold,
-               store.archivedSummary().count > 0 || !ChatPrefs.locked.isEmpty {
+            guard let d = pullDistance else { return }
+            let travel = atTop ? max(0, d + e.scrollingDeltaY) : 0
+            pullDistance = travel
+            if pullArmed, travel < Self.pullTravel / 2 {
+                pullArmed = false
+            } else if !pullArmed, travel >= Self.pullTravel,
+                      store.archivedSummary().count > 0 || !ChatPrefs.locked.isEmpty {
                 pullArmed = true
                 NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
             }
         case .ended:
+            pullDistance = nil
             guard pullArmed else { return }
             pullArmed = false
             revealArchive()
+        case .cancelled:
+            pullArmed = false
+            pullDistance = nil
         default:
             break
         }
