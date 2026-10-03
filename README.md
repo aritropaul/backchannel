@@ -18,6 +18,28 @@ On first launch, scan the QR code from your phone (Settings → Linked Devices �
 
 Coming from a build named WA: the first launch quits if WA is still running, then copies WA's settings, backs up `session.db` and `app.db` to `Application Support/Backchannel backup <date>/`, moves the data folder, and repoints the stored file paths (avatars, media, stickers). The phone stays linked.
 
+## Releasing
+
+Push a version tag and GitHub Actions builds the DMG and publishes it as a release (`.github/workflows/release.yml`, on a `macos-26` runner with Xcode 26.3):
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag sets the version (`CFBundleShortVersionString` 0.2.0) and the run number sets the build. Running the workflow by hand (Actions › Release › Run workflow) makes a test build that's kept as an artifact for a week and publishes nothing. Locally, `VERSION=0.2.0 BUILD=12 make dmg` stamps the same way.
+
+Signing and notarization switch on when these repository secrets exist (Settings › Secrets and variables › Actions). Without them the release is ad-hoc signed, and people approve it once in System Settings › Privacy & Security.
+
+| Secret | What it is |
+|---|---|
+| `MACOS_CERTIFICATE` | Your Developer ID Application certificate and key, exported as a .p12 and base64-encoded (`base64 -i cert.p12 \| pbcopy`) |
+| `MACOS_CERTIFICATE_PASSWORD` | The password you gave the .p12 |
+| `APPLE_ID` | The Apple ID email of your developer account |
+| `APPLE_TEAM_ID` | Your 10-character team ID |
+| `APPLE_APP_PASSWORD` | An app-specific password for that Apple ID (account.apple.com › Sign-In and Security) |
+
+`gh secret set MACOS_CERTIFICATE < cert.b64` and so on sets them from the terminal. Signed releases use the hardened runtime with the entitlements in `app/Backchannel.entitlements` (camera and microphone).
+
 ## Architecture
 
 ```

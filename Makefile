@@ -3,6 +3,10 @@
 #   make dmg      the app in a disk image, build/Backchannel-<version>.dmg
 #   make run      build and launch
 #   make core     just the Go c-archive
+#   VERSION=0.2.0 BUILD=12 make dmg   stamp a version (releases do this from the tag)
+#
+# Releases: push a tag like v0.2.0 and .github/workflows/release.yml builds, signs and
+# notarizes (when the Developer ID secrets are set) and publishes the DMG.
 
 SDK      := $(shell xcrun --sdk macosx --show-sdk-path)
 GO       ?= $(shell command -v go || echo /opt/homebrew/bin/go)
@@ -10,6 +14,7 @@ CORE_SRC := $(wildcard core/*.go) core/go.mod core/go.sum Makefile
 APP      := build/Backchannel.app
 CONFIG   ?= Release
 LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+STAMP    := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) $(if $(BUILD),CURRENT_PROJECT_VERSION=$(BUILD))
 
 .PHONY: all core app run clean project dmg site
 
@@ -34,7 +39,7 @@ project: app/Backchannel.xcodeproj
 
 app: core app/Backchannel.xcodeproj
 	xcodebuild -project app/Backchannel.xcodeproj -scheme Backchannel -configuration $(CONFIG) \
-		-derivedDataPath build/dd -quiet build
+		-derivedDataPath build/dd -quiet build $(STAMP)
 	@# One app on disk: move Xcode's product out rather than copying it (a second copy
 	@# shows up in Spotlight and Launchpad and can be launched by bundle ID).
 	@rm -rf $(APP) && mv build/dd/Build/Products/$(CONFIG)/Backchannel.app $(APP)
