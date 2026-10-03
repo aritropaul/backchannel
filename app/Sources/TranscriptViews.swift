@@ -46,21 +46,47 @@ enum Motion {
     }
 }
 
-/// Reactions on a bubble's top corner: a round, dark frosted-glass bubble per emoji
-/// (overlapping when there are several, the most used on top), and the count in one
-/// more when more people reacted than there are emoji shown.
+/// Reactions on a bubble's top corner, in dark frosted glass like Messages' tapbacks: a
+/// circle for a single reaction, a pill for several (the emoji side by side, then "+N" for
+/// the people beyond them).
 final class ReactionBadgeView: NSView {
-    /// Room for a 12pt emoji with about 10pt of glass around it.
+    /// Room for a 12pt emoji with about 10pt of glass around it; the pill's height too.
     static let side: CGFloat = 32
-    /// Centre-to-centre distance of overlapping circles.
-    static let step: CGFloat = 22
+    /// The pill's ends match the circle's glass around an emoji.
+    private static let padX: CGFloat = 10
+    private static let gap: CGFloat = 2
+    private static let countGap: CGFloat = 5
+    private static let emojiFont = NSFont.systemFont(ofSize: 12)
+    private static let countFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
 
     static func glyphs(_ r: Reactions) -> [String] { r.emoji.map(String.init) }
-    static func showsCount(_ r: Reactions) -> Bool { r.total > glyphs(r).count }
+    /// People who reacted beyond the emoji shown.
+    static func extra(_ r: Reactions) -> Int { max(0, r.total - glyphs(r).count) }
+
+    private static func items(_ r: Reactions) -> [(text: String, font: NSFont)] {
+        var out = glyphs(r).map { (text: $0, font: emojiFont) }
+        if extra(r) > 0 { out.append((text: "+\(extra(r))", font: countFont)) }
+        return out
+    }
+
+    /// Where each item sits (the emoji in order, then the count), in badge coordinates.
+    static func slots(for r: Reactions) -> [CGRect] {
+        let items = items(r)
+        guard items.count > 1 else { return [CGRect(x: 0, y: 0, width: side, height: side)] }
+        var x = padX
+        var out: [CGRect] = []
+        for (i, it) in items.enumerated() {
+            if i > 0 { x += i == items.count - 1 && extra(r) > 0 ? countGap : gap }
+            let w = ceil(NSAttributedString(string: it.text, attributes: [.font: it.font]).size().width)
+            out.append(CGRect(x: x, y: 0, width: w, height: side))
+            x += w
+        }
+        return out
+    }
 
     static func size(for r: Reactions) -> CGSize {
-        let n = glyphs(r).count + (showsCount(r) ? 1 : 0)
-        return CGSize(width: side + CGFloat(max(0, n - 1)) * step, height: side)
+        let s = slots(for: r)
+        return CGSize(width: s.count > 1 ? s[s.count - 1].maxX + padX : side, height: side)
     }
 
     private let frost = FrostView()
@@ -80,16 +106,11 @@ final class ReactionBadgeView: NSView {
     override var isFlipped: Bool { true }
 
     func configure(_ r: Reactions) {
-        var items = Self.glyphs(r)
-        if Self.showsCount(r) { items.append("\(r.total)") }
-        ink.items = items
-        ink.counted = Self.showsCount(r)
-        ink.mine = !r.mine.isEmpty
+        let size = Self.size(for: r)
+        ink.items = Array(zip(Self.items(r), Self.slots(for: r))).map { (text: $0.0.text, font: $0.0.font, slot: $0.1) }
         ink.frame = bounds
         ink.needsDisplay = true
-        let shape = NSBezierPath()
-        for i in items.indices { shape.appendOval(in: Self.circle(i)) }
-        frost.shape(shape)
+        frost.shape(Self.shape(CGRect(origin: .zero, size: size)))
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -97,35 +118,29 @@ final class ReactionBadgeView: NSView {
         ink.frame = bounds
     }
 
-    static func circle(_ i: Int) -> CGRect {
-        CGRect(x: CGFloat(i) * step, y: 0, width: side, height: side)
+    /// A circle, or a capsule with the circle's round ends.
+    static func shape(_ r: CGRect) -> NSBezierPath {
+        NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
     }
 
-    /// The glass's tint, rims and emoji, above the blur.
+    /// The glass's tint, rim and contents, above the blur.
     private final class Ink: NSView {
-        var items: [String] = []
-        var counted = false
-        var mine = false
+        var items: [(text: String, font: NSFont, slot: CGRect)] = []
         override var isFlipped: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
         override func draw(_ dirtyRect: NSRect) {
-            // Last first, so the most used reaction sits on top.
-            for i in items.indices.reversed() {
-                let c = ReactionBadgeView.circle(i)
-                let disc = NSBezierPath(ovalIn: c.insetBy(dx: 0.5, dy: 0.5))
-                NSColor.black.withAlphaComponent(0.32).setFill()
-                disc.fill()
-                // A faint edge where the glass meets what's behind it, the same for everyone's.
-                NSColor.white.withAlphaComponent(0.1).setStroke()
-                disc.lineWidth = 1
-                disc.stroke()
-                let isCount = counted && i == items.count - 1
-                let s = NSAttributedString(string: items[i], attributes: [
-                    .font: isCount ? NSFont.systemFont(ofSize: 12, weight: .semibold) : NSFont.systemFont(ofSize: 12),
-                    .foregroundColor: NSColor.white])
+            let glass = ReactionBadgeView.shape(bounds.insetBy(dx: 0.5, dy: 0.5))
+            NSColor.black.withAlphaComponent(0.32).setFill()
+            glass.fill()
+            // A faint edge where the glass meets what's behind it, the same for everyone's.
+            NSColor.white.withAlphaComponent(0.1).setStroke()
+            glass.lineWidth = 1
+            glass.stroke()
+            for it in items {
+                let s = NSAttributedString(string: it.text, attributes: [.font: it.font, .foregroundColor: NSColor.white])
                 let sz = s.size()
-                s.draw(at: CGPoint(x: c.midX - sz.width / 2, y: c.midY - sz.height / 2))
+                s.draw(at: CGPoint(x: it.slot.midX - sz.width / 2, y: it.slot.midY - sz.height / 2))
             }
         }
     }
