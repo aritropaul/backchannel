@@ -1016,38 +1016,40 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         showStickerCard(m, from: cell, at: r)
     }
 
+    /// The message menu, laid out like Messages': reactions on top, then what you can do
+    /// with the message, then what you can do to it, then deleting.
     func menu(for m: Message) -> NSMenu {
         let menu = NSMenu()
+        var group: [NSMenuItem] = []
         func item(_ title: String, _ symbol: String?, _ action: @escaping @MainActor () -> Void) {
             let i = ClosureMenuItem(title: title, action: action)
             if let symbol { i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
-            menu.addItem(i)
+            group.append(i)
+        }
+        func endGroup() {
+            guard !group.isEmpty else { return }
+            if !menu.items.isEmpty { menu.addItem(.separator()) }
+            group.forEach(menu.addItem)
+            group = []
         }
         let live = m.kind != .revoked && m.kind != .pending
-        if live { item("Reply", "arrowshape.turn.up.left") { [weak self] in self?.reply(to: m) } }
-        if m.kind == .sticker, !m.mediaPath.isEmpty {
-            let sticker = StickerItem(path: m.mediaPath, mime: m.mime, width: m.width, height: m.height)
-            let fav = StickerLibrary.hash(of: m.mediaPath).map { store.isFavoriteSticker(hash: $0) } ?? false
-            item(fav ? "Remove from Favorites" : "Add to Favorites", fav ? "star.slash" : "star") {
-                ConversationViewController.setFavorite(sticker, !fav)
-            }
-        }
+
         if live {
-            let react = NSMenuItem(title: "React", action: nil, keyEquivalent: "")
-            react.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: nil)
-            let sub = NSMenu()
-            for e in ["👍", "❤️", "😂", "😮", "😢", "🙏"] {
-                let mine = m.reactions?.mine == e
-                let i = ClosureMenuItem(title: e) { [weak self] in self?.react(m, mine ? "" : e) }
-                i.state = mine ? .on : .off
-                sub.addItem(i)
-            }
-            if let mine = m.reactions?.mine, !mine.isEmpty {
-                sub.addItem(.separator())
-                sub.addItem(ClosureMenuItem(title: "Remove reaction") { [weak self] in self?.react(m, "") })
-            }
-            react.submenu = sub
-            menu.addItem(react)
+            let mine = m.reactions?.mine
+            let strip = ReactionStripView(recent: EmojiCatalog.recent, mine: mine?.isEmpty == false ? mine : nil,
+                                          onPick: { [weak self] e in
+                                              EmojiCatalog.used(e)
+                                              self?.react(m, e == mine ? "" : e)
+                                          },
+                                          onMore: { [weak self] in self?.pickReaction(for: m) })
+            let header = NSMenuItem()
+            header.view = strip
+            menu.addItem(header)
+        }
+
+        if live { item("Reply…", "arrowshape.turn.up.left") { [weak self] in self?.reply(to: m) } }
+        if m.fromMe && live && m.kind == .text && Date().timeIntervalSince(m.date) < 15 * 60 {
+            item("Edit…", "pencil") { [weak self] in self?.beginEdit(m) }
         }
         if live {
             item(m.starred ? "Unstar" : "Star", m.starred ? "star.slash" : "star") { [weak self] in
@@ -1055,6 +1057,11 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
                 Task { _ = await Core.shared.callAsync("star", ["chat": chat, "id": m.id, "on": !m.starred]) }
             }
         }
+        if m.fromMe && m.status == MessageStatus.failed {
+            item("Try Again", "arrow.clockwise") { [weak self] in self?.retry(m) }
+        }
+        endGroup()
+
         if !m.text.isEmpty && live {
             item("Copy", "doc.on.doc") {
                 NSPasteboard.general.clearContents()
@@ -1067,17 +1074,38 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
                 item("Show in Finder", "folder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: m.mediaPath)]) }
             }
         }
-        if m.fromMe && m.status == MessageStatus.failed {
-            item("Retry", "arrow.clockwise") { [weak self] in self?.retry(m) }
+        if m.kind == .sticker, !m.mediaPath.isEmpty {
+            let sticker = StickerItem(path: m.mediaPath, mime: m.mime, width: m.width, height: m.height)
+            let fav = StickerLibrary.hash(of: m.mediaPath).map { store.isFavoriteSticker(hash: $0) } ?? false
+            item(fav ? "Remove from Favorites" : "Add to Favorites", fav ? "star.slash" : "star") {
+                ConversationViewController.setFavorite(sticker, !fav)
+            }
         }
-        if m.fromMe && live && m.kind == .text && Date().timeIntervalSince(m.date) < 15 * 60 {
-            item("Edit", "pencil") { [weak self] in self?.beginEdit(m) }
-        }
+        endGroup()
+
         if m.fromMe && live && Date().timeIntervalSince(m.date) < 2 * 24 * 3600 {
-            menu.addItem(.separator())
-            item("Delete for Everyone", "trash") { [weak self] in self?.confirmRevoke(m) }
+            item("Delete for Everyone…", "trash") { [weak self] in self?.confirmRevoke(m) }
         }
+        endGroup()
         return menu
+    }
+
+    /// The menu's smiley: any emoji as the reaction, from a picker on the message.
+    private func pickReaction(for m: Message) {
+        guard let row = rowIndex(of: m.id),
+              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView,
+              let item = cell.item, let anchor = item.bubble ?? item.mediaRect ?? item.cardRect else { return }
+        let picker = ReactionPickerViewController()
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = picker
+        pop.contentSize = ReactionPickerViewController.size
+        picker.onPick = { [weak self, weak pop] e in
+            EmojiCatalog.used(e)
+            self?.react(m, e)
+            pop?.performClose(nil)
+        }
+        pop.show(relativeTo: anchor, of: cell, preferredEdge: .maxY)
     }
 
     private func react(_ m: Message, _ emoji: String) {

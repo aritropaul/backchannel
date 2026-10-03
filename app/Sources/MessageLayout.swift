@@ -90,7 +90,7 @@ final class MessageLayout {
         let maxBubble = min(max(width * 0.66, 200), 520, width - 80 - (flags.gutter ? 30 : 0))
         let fromMe = msg.fromMe
         var y: CGFloat = flags.firstInRun ? 10 : 2
-        if msg.reactions != nil { y += 22 }
+        if msg.reactions != nil { y += Self.reactionRise }
 
         if flags.showSender {
             let s = TextBlock(NSAttributedString(string: msg.senderName, attributes: [.font: Theme.small, .foregroundColor: Theme.meta]),
@@ -189,13 +189,17 @@ final class MessageLayout {
         height = y + (flags.lastInRun ? 2 : 0)
     }
 
+    /// How far a reaction badge rises above its bubble (and the room kept for it).
+    static let reactionRise: CGFloat = 16
+
     private func reactionAnchor(_ block: CGRect) {
         guard let r = msg.reactions else { return }
         let size = ReactionBadgeView.size(for: r)
         let w = size.width, h = size.height
-        // Incoming: top-right corner. Outgoing: top-left corner. Overlapping outward.
-        let x = msg.fromMe ? block.minX - w + 10 : block.maxX - 10
-        reactionRect = CGRect(x: min(max(4, x), width - w - 4), y: block.minY - 22, width: w, height: h)
+        // Incoming: top-right corner. Outgoing: top-left corner. Sat on the corner, about half
+        // on the bubble as in Messages; a 10pt overlap read as detached past the 17pt corner radius.
+        let x = msg.fromMe ? block.minX - w + 18 : block.maxX - 18
+        reactionRect = CGRect(x: min(max(4, x), width - w - 4), y: block.minY - Self.reactionRise, width: w, height: h)
     }
 
     private func mediaSize(_ maxBubble: CGFloat) -> CGSize {
