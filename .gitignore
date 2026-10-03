@@ -6,3 +6,6 @@ xcuserdata/
 .DS_Store
 # Built disk images copied for the site (make site)
 site/*.dmg
+# Personal notes stay on this Mac; only the README is published.
+*.md
+!README.md
