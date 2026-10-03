@@ -842,7 +842,8 @@ func (a *App) notifyReaction(r *msgRow, chat types.JID, target, emoji string) {
 		return
 	}
 	var muted int64
-	a.rdb.QueryRow(`SELECT muted_until FROM chats WHERE jid=?`, r.Chat).Scan(&muted)
+	var archived int
+	a.rdb.QueryRow(`SELECT muted_until, archived FROM chats WHERE jid=?`, r.Chat).Scan(&muted, &archived)
 	sj, _ := types.ParseJID(r.Sender)
 	who := a.nameFor(sj)
 	if who == "" {
@@ -853,13 +854,15 @@ func (a *App) notifyReaction(r *msgRow, chat types.JID, target, emoji string) {
 		body = strings.TrimSpace(who) + " reacted " + emoji + " to “" + previewText(&msgRow{Kind: kind, Text: text, FileName: fileName}) + "”"
 	}
 	emit(map[string]any{"t": "notify", "chat": r.Chat, "id": "reaction-" + r.ID, "title": a.nameFor(chat), "body": body,
-		"muted": muted == -1 || muted > time.Now().Unix(), "reaction": true})
+		"muted": archived == 1 || muted == -1 || muted > time.Now().Unix(), "reaction": true})
 }
 
 func (a *App) notify(r *msgRow, chat types.JID) {
 	var muted int64
-	a.rdb.QueryRow(`SELECT muted_until FROM chats WHERE jid=?`, r.Chat).Scan(&muted)
-	isMuted := muted == -1 || muted > time.Now().Unix()
+	var archived int
+	a.rdb.QueryRow(`SELECT muted_until, archived FROM chats WHERE jid=?`, r.Chat).Scan(&muted, &archived)
+	// Archived chats stay archived and stay quiet, like WhatsApp's "Keep chats archived".
+	isMuted := archived == 1 || muted == -1 || muted > time.Now().Unix()
 	title := a.nameFor(chat)
 	body := previewText(r)
 	if chat.Server == types.GroupServer {
