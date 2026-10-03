@@ -122,6 +122,8 @@ final class ComposerView: NSView, NSTextViewDelegate {
         ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.10) : NSColor.white.withAlphaComponent(0.55)
     }
     private let stack = NSStackView()
+    /// Everything inside the capsule; its layer crossfades when the row swaps for the recorder.
+    private let fieldContent = NSView()
     private let row = NSView()
     private let scroll = NSScrollView()
     let textView = PlaceholderTextView()
@@ -215,7 +217,8 @@ final class ComposerView: NSView, NSTextViewDelegate {
         field.translatesAutoresizingMaskIntoConstraints = false
         field.cornerRadius = Self.control / 2
         field.tintColor = Self.glassTint
-        let content = NSView()
+        let content = fieldContent
+        content.wantsLayer = true
         glass(field, content)
 
         stack.orientation = .vertical
@@ -590,8 +593,13 @@ final class ComposerView: NSView, NSTextViewDelegate {
             do { try r.start() } catch { NSSound.beep(); return }
             self.recorder = r
             self.meter.reset()
+            // The mic is live: a tick, the row crossfades to the recorder and the dot pops on.
+            Haptic.arm()
+            if !Theme.reduceMotion { Motion.crossfade(self.fieldContent.layer, duration: 0.18) }
             self.row.isHidden = true
             self.recordRow.isHidden = false
+            self.layoutSubtreeIfNeeded()
+            Motion.pop(self.recordDot.layer, size: self.recordDot.bounds.size, from: 0.3, response: 0.35, damping: 0.55)
             self.pulseDot(true)
             let t = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -610,6 +618,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
         recordTimer?.invalidate()
         recordTimer = nil
         pulseDot(false)
+        Motion.crossfade(fieldContent.layer, duration: 0.15)
         recordRow.isHidden = true
         row.isHidden = false
         recordTime.stringValue = "0:00"

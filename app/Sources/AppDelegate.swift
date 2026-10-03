@@ -65,6 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 (main.contentViewController as? NSSplitViewController)?.splitView.setPosition(snapped, ofDividerAt: 0)
             }
         }
+        if let out = env["WA_BADGES"] { DevMoments.renderBadges(to: out) }
+        if let spec = env["WA_MOMENTS"] {
+            // Dev: plays the motion moments locally, nothing sent (DevMoments.swift).
+            DevMoments.run(spec, main: main)
+        }
         if env["WA_PULL"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak main] in main?.list.revealArchive() }
         }

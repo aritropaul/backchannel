@@ -25,6 +25,10 @@ final class MessageLayout {
     private(set) var mediaRect: CGRect?
     /// Where the tapback badge sits, in row coordinates.
     private(set) var reactionRect: CGRect?
+    /// The block a tapback attaches to (bubble, photo, card or big emoji), with or without one.
+    private(set) var tapbackBlock: CGRect?
+    /// A message that's one emoji and nothing else, drawn large without a bubble.
+    private(set) var bigEmojiRect: CGRect?
     private var tail = false
     private var sender: TextBlock?
     private var senderOrigin = CGPoint.zero
@@ -131,6 +135,7 @@ final class MessageLayout {
             mediaRect = nil
             bubble = nil
             y += t.size.height
+            if emojiCount == 1 { bigEmojiRect = CGRect(origin: textOrigin, size: t.size) }
             reactionAnchor(CGRect(origin: textOrigin, size: t.size))
         } else if visual {
             let r = mediaSize(maxBubble)
@@ -193,13 +198,31 @@ final class MessageLayout {
     static let reactionRise: CGFloat = 16
 
     private func reactionAnchor(_ block: CGRect) {
+        tapbackBlock = block
         guard let r = msg.reactions else { return }
         let size = ReactionBadgeView.size(for: r)
-        let w = size.width, h = size.height
-        // Incoming: top-right corner. Outgoing: top-left corner. Sat on the corner, about half
-        // on the bubble as in Messages; a 10pt overlap read as detached past the 17pt corner radius.
+        reactionRect = CGRect(x: badgeX(block, width: size.width), y: block.minY - Self.reactionRise,
+                              width: size.width, height: size.height)
+    }
+
+    /// Incoming: top-right corner. Outgoing: top-left corner. Sat on the corner, about half
+    /// on the bubble as in Messages; a 10pt overlap read as detached past the 17pt corner radius.
+    private func badgeX(_ block: CGRect, width w: CGFloat) -> CGFloat {
         let x = msg.fromMe ? block.minX - w + 18 : block.maxX - 18
-        reactionRect = CGRect(x: min(max(4, x), width - w - 4), y: block.minY - Self.reactionRise, width: w, height: h)
+        return min(max(4, x), width - w - 4)
+    }
+
+    /// Where a reaction will land: its circle in the badge, or, before the message has
+    /// any, where the first badge will sit once the row makes room for it (the block moves
+    /// down by `reactionRise` and the badge takes its old top).
+    func landing(for emoji: String) -> CGRect? {
+        if let rr = reactionRect, let r = msg.reactions {
+            let i = ReactionBadgeView.glyphs(r).firstIndex(of: emoji) ?? 0
+            return ReactionBadgeView.slots(for: r)[i].offsetBy(dx: rr.minX, dy: rr.minY)
+        }
+        guard let block = tapbackBlock else { return nil }
+        let side = ReactionBadgeView.side
+        return CGRect(x: badgeX(block, width: side), y: block.minY, width: side, height: side)
     }
 
     private func mediaSize(_ maxBubble: CGFloat) -> CGSize {
@@ -722,6 +745,9 @@ final class MessageLayout {
     }
 
     /// Rounded bubble; the last bubble of a run curls into a tail at its bottom outer corner.
+    /// The bubble's outline, tail included (what the jump highlight shades).
+    var bubbleOutline: NSBezierPath? { bubble.map { Self.bubblePath($0, fromMe: msg.fromMe, tail: tail) } }
+
     static func bubblePath(_ r: CGRect, fromMe: Bool, tail: Bool) -> NSBezierPath {
         let rad = min(radius, r.height / 2)
         guard tail else { return NSBezierPath(roundedRect: r, xRadius: rad, yRadius: rad) }

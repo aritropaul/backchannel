@@ -385,6 +385,23 @@ private final class ZoomScrollView: NSScrollView {
         // Unzoomed, a scroll does nothing; zoomed, it pans.
         if magnification > 1 { super.scrollWheel(with: event) }
     }
+
+    /// The zoom limit the pinch is pressing against: -1 at fit, 1 at the maximum.
+    private var limit: Int? {
+        if magnification >= maxMagnification - 0.01 { return 1 }
+        if magnification <= minMagnification + 0.01 { return -1 }
+        return nil
+    }
+    private var lastLimit: Int?
+
+    /// A pinch that reaches fit or the 5× maximum ticks as it meets the stop.
+    override func magnify(with event: NSEvent) {
+        if event.phase == .began { lastLimit = limit }
+        super.magnify(with: event)
+        let now = limit
+        if let now, now != lastLimit, event.phase == .changed { Haptic.snap() }
+        lastLimit = now
+    }
 }
 
 /// A round Liquid Glass button, the same circle as the composer's + and the header's ⋯.

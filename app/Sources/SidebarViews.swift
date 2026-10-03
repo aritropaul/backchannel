@@ -331,12 +331,14 @@ final class ChatCellView: NSTableCellView {
     func configure(_ c: Chat, typing: Bool) {
         let changed = chat?.jid == c.jid && hit == nil && (chat != c || self.typing != typing)
         if changed { Motion.crossfade(layer) }
+        let turnedUnread = changed && dot.isHidden && c.hasUnread
         hit = nil
         chat = c
         self.typing = typing
         name.stringValue = c.name
         time.stringValue = c.lastTS > 0 ? Fmt.listStamp(Date(timeIntervalSince1970: TimeInterval(c.lastTS) / 1000)) : ""
         dot.isHidden = !c.hasUnread
+        if turnedUnread { Motion.popDot(dot) }
         muted.isHidden = compact || !c.isMuted
         preview.stringValue = Self.previewText(c, typing: typing)
         toolTip = compact ? c.name : nil
@@ -406,10 +408,13 @@ final class PinnedTile: NSView {
     }
 
     func configure(_ c: Chat) {
-        if chat?.jid == c.jid, chat != c { Motion.crossfade(layer) }
+        let changed = chat?.jid == c.jid && chat != c
+        if changed { Motion.crossfade(layer) }
+        let turnedUnread = changed && dot.isHidden && c.hasUnread
         chat = c
         name.stringValue = c.name
         dot.isHidden = !c.hasUnread
+        if turnedUnread { Motion.popDot(dot) }
         avatar.load(c, px: 144)
         applyColors()
         setAccessibilityRole(.button)

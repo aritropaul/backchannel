@@ -13,16 +13,18 @@ final class ReactionStripView: NSView {
     private static let padBottom: CGFloat = 4
     private static let columns = 6
     /// 21pt draws a glyph about 25pt tall, leaving an even ring of disc around a chosen one.
-    private static let font = NSFont(name: "Apple Color Emoji", size: 21) ?? .systemFont(ofSize: 21)
+    private static let font = NSFont(name: "Apple Color Emoji", size: glyphSize) ?? .systemFont(ofSize: glyphSize)
+    static let glyphSize: CGFloat = 21
 
     /// nil is the "any emoji" button.
     private let cells: [String?]
     private let mine: String?
-    private let onPick: (String) -> Void
+    /// The emoji, and its cell on screen (where it flies to the message from).
+    private let onPick: (String, CGRect?) -> Void
     private let onMore: () -> Void
     private var hover: Int? { didSet { if hover != oldValue { needsDisplay = true } } }
 
-    init(recent: [String], mine: String?, onPick: @escaping (String) -> Void, onMore: @escaping () -> Void) {
+    init(recent: [String], mine: String?, onPick: @escaping (String, CGRect?) -> Void, onMore: @escaping () -> Void) {
         var second = recent.filter { !Self.quick.contains($0) }
         for e in Self.fill where second.count < Self.columns - 1 && !second.contains(e) { second.append(e) }
         cells = Self.quick + Array(second.prefix(Self.columns - 1)) + [nil]
@@ -98,10 +100,14 @@ final class ReactionStripView: NSView {
 
     private func choose(_ i: Int) {
         let pick = cells[i]
+        // Read while the menu is still on screen; the emoji takes off from here.
+        var r = rect(i)
+        r.origin.y += 1   // the glyph's optical nudge in draw(_:)
+        let from = window.map { $0.convertToScreen(convert(r, to: nil)) }
         enclosingMenuItem?.menu?.cancelTracking()
         // Act once the menu has closed, so a popover or the transcript update isn't fighting it.
         DispatchQueue.main.async { [onPick, onMore] in
-            if let pick { onPick(pick) } else { onMore() }
+            if let pick { onPick(pick, from) } else { onMore() }
         }
     }
 

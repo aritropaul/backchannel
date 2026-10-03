@@ -567,8 +567,26 @@ final class MainSplitViewController: NSSplitViewController {
 
     // NSSplitViewController declares this but doesn't implement it, so there's no super to call.
     override func splitView(_ splitView: NSSplitView, constrainSplitPosition proposed: CGFloat, ofSubviewAt index: Int) -> CGFloat {
-        index == 0 ? Self.snap(proposed) : proposed
+        guard index == 0 else { return proposed }
+        let p = Self.snap(proposed)
+        // A drag that flips the sidebar between the compact column and the full list
+        // locks into the new width with a tick.
+        if let e = NSApp.currentEvent, e.type == .leftMouseDragged {
+            let compact = p <= Self.compactPosition + 0.5
+            // A pause longer than a drag's events means a new drag (the sidebar may have been
+            // toggled from the keyboard since the last one).
+            if let was = dragCompact, e.timestamp - dragTime < 0.5, was != compact { Haptic.snap() }
+            dragCompact = compact
+            dragTime = e.timestamp
+        } else {
+            dragCompact = nil
+        }
+        return p
     }
+
+    /// Which side of the snap the divider drag in progress is on.
+    private var dragCompact: Bool?
+    private var dragTime: TimeInterval = 0
 
     /// The floating glass sidebar sits 8pt in from the window edge, so the divider's
     /// position is the sidebar's thickness + 8 (measured: setPosition(94) arrives as 102).

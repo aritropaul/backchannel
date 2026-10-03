@@ -332,18 +332,101 @@ final class BubbleView: NSView {
         updateFrost()
         needsDisplay = true
         toolTip = Fmt.tooltip(item.msg.date)
+        if old?.msg.id != item.msg.id { endSwipe(commit: false, velocity: 0, animated: false) }
         if let rr = item.reactionRect, let r = item.msg.reactions {
+            let wasHidden = badge.isHidden || badge.layer?.animation(forKey: "out") != nil
+            badge.layer?.removeAnimation(forKey: "out")
             badge.frame = rr
             badge.configure(r)
-            let appeared = badge.isHidden || (sameMessage && old?.msg.reactions != r)
+            let appeared = wasHidden || (sameMessage && old?.msg.reactions != r)
             badge.isHidden = false
-            if sameMessage && appeared {
-                Motion.pop(badge.layer, size: rr.size, from: 0.5, response: 0.35, damping: 0.62)
+            // A reaction of mine is still in the air: the badge shows when it lands.
+            let inFlight = controller?.landing[item.msg.id] != nil
+            if inFlight && (wasHidden || badge.alphaValue == 0) {
+                badge.alphaValue = 0
+            } else {
+                badge.alphaValue = 1
+                if sameMessage && appeared && !inFlight {
+                    Motion.pop(badge.layer, size: rr.size, from: 0.5, response: 0.35, damping: 0.62)
+                }
             }
+        } else if sameMessage, !badge.isHidden, badge.alphaValue > 0, let layer = badge.layer, !Theme.reduceMotion {
+            // Taken back: the badge shrinks away where it was, faster than it arrived.
+            let size = badge.bounds.size
+            let shrink = CABasicAnimation(keyPath: "transform")
+            shrink.toValue = Motion.scale(0.6, in: size)
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.toValue = 0
+            let out = CAAnimationGroup()
+            out.animations = [shrink, fade]
+            out.duration = 0.14
+            out.timingFunction = Theme.easeOut
+            out.fillMode = .forwards
+            out.isRemovedOnCompletion = false
+            CATransaction.begin()
+            CATransaction.setCompletionBlock { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.badge.layer?.animation(forKey: "out") != nil else { return }
+                    self.badge.layer?.removeAnimation(forKey: "out")
+                    if self.item?.msg.reactions == nil { self.badge.isHidden = true }
+                }
+            }
+            layer.add(out, forKey: "out")
+            CATransaction.commit()
         } else {
+            badge.layer?.removeAnimation(forKey: "out")
             badge.isHidden = true
         }
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// My reaction's emoji has arrived from the menu: the badge takes it with a thump and a
+    /// tick. If the reaction's echo hasn't laid the badge out yet, it pops when it does.
+    func landReaction() {
+        guard let rr = item?.reactionRect, !badge.isHidden else { return }
+        badge.alphaValue = 1
+        Motion.pop(badge.layer, size: rr.size, from: 1.3, response: 0.42, damping: 0.5)
+        Haptic.snap()
+    }
+
+    /// The landing spot for a reaction, in window coordinates (nil when off screen).
+    func reactionLanding(for emoji: String) -> CGRect? {
+        guard let r = item?.landing(for: emoji), !visibleRect.isEmpty else { return nil }
+        return convert(r, to: nil)
+    }
+
+    /// A lone heart that just arrived (sent or received) beats, once it has risen.
+    func beatIfHeart() {
+        guard let item, let r = item.bigEmojiRect, Motion.isHeart(item.msg.text) else { return }
+        Motion.heartbeat(layer, about: CGPoint(x: r.midX, y: r.midY), delay: 0.2)
+    }
+
+    /// Something pointed at this message: it swells and settles, and its highlight fades.
+    func nudge() {
+        guard let item, let b = item.tapbackBlock ?? item.bigEmojiRect else { return }
+        Motion.nudge(layer, about: CGPoint(x: b.midX, y: b.midY))
+    }
+
+    /// The highlight lets go as a shade whose opacity fades; a crossfade of the redrawn
+    /// bubble would dip darker than either state halfway through.
+    func fadeHighlight() {
+        highlight = false
+        guard let item, let outline = item.bubbleOutline, let layer, !Theme.reduceMotion else { return }
+        let shade = CAShapeLayer()
+        shade.path = outline.cgPath
+        shade.fillColor = NSColor.black.withAlphaComponent(item.msg.fromMe ? 0.15 : 0.08).cgColor
+        shade.zPosition = 10
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { MainActor.assumeIsolated { shade.removeFromSuperlayer() } }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        fade.duration = 0.45
+        fade.timingFunction = Theme.easeOut
+        shade.opacity = 0
+        shade.add(fade, forKey: "fade")
+        layer.addSublayer(shade)
+        CATransaction.commit()
     }
 
     func drawContent() {
@@ -387,12 +470,241 @@ final class BubbleView: NSView {
         return controller?.menu(for: item.msg)
     }
 
+    // MARK: swipe to reply
+
+    /// How far a message travels under the fingers before letting go replies.
+    static let replyTravel: CGFloat = 64
+    /// The fingers' travel in a two-finger swipe on this message, while one is under way.
+    private var swipeTravel: CGFloat?
+    private var swipeArmed = false
+    private var swipeSamples: [(t: TimeInterval, travel: CGFloat)] = []
+    /// After a swipe its momentum is swallowed, so the coast can't scroll the transcript.
+    private var swallowMomentum = false
+    /// A touch landed on this message and hasn't moved yet.
+    private var touchPending = false
+    private var replyIcon: ReplyIconView?
+
+    private var canSwipe: Bool {
+        guard let m = item?.msg, controller != nil else { return false }
+        return m.kind != .revoked && m.kind != .pending && m.kind != .notice
+    }
+
+    /// Two fingers moving sideways over a message pull it along to reply, as WhatsApp's
+    /// swipe does; anything else is the transcript's scroll. The touch is held back until
+    /// the first movement says which it is, because the scroll view takes the whole
+    /// gesture (off the main thread) from the first event it's handed.
+    override func scrollWheel(with event: NSEvent) {
+        if handleSwipe(event) { return }
+        super.scrollWheel(with: event)
+    }
+
+    private func handleSwipe(_ e: NSEvent) -> Bool {
+        if !e.momentumPhase.isEmpty {
+            guard swallowMomentum else { return false }
+            if e.momentumPhase == .ended || e.momentumPhase == .cancelled { swallowMomentum = false }
+            return true
+        }
+        switch e.phase {
+        case .mayBegin:
+            // Mid-coast the scroll view needs the touch to stop the momentum.
+            guard canSwipe, controller?.isScrolling == false else { return false }
+            touchPending = true
+            return true
+        case .began:
+            touchPending = false
+            swallowMomentum = false
+            guard canSwipe, e.hasPreciseScrollingDeltas, abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) * 1.5 else { return false }
+            replyIcon?.removeFromSuperview()
+            replyIcon = nil
+            layer?.removeAnimation(forKey: "swipeBack")
+            swipeTravel = 0
+            swipeSamples = []
+            swipeMoved(by: e.scrollingDeltaX, at: e.timestamp)
+            return true
+        case .changed:
+            guard swipeTravel != nil else { return false }
+            swipeMoved(by: e.scrollingDeltaX, at: e.timestamp)
+            return true
+        case .ended, .cancelled:
+            if touchPending {   // a touch that never moved
+                touchPending = false
+                return true
+            }
+            guard swipeTravel != nil else { return false }
+            endSwipe(commit: e.phase == .ended && swipeArmed, velocity: swipeVelocity, animated: true)
+            swallowMomentum = true
+            return true
+        default:
+            return swipeTravel != nil
+        }
+    }
+
+    private func swipeMoved(by dx: CGFloat, at t: TimeInterval) {
+        guard var travel = swipeTravel else { return }
+        travel += dx
+        swipeTravel = travel
+        swipeSamples.append((t, travel))
+        if swipeSamples.count > 6 { swipeSamples.removeFirst() }
+        let offset = Self.swipeOffset(travel)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.sublayerTransform = CATransform3DMakeTranslation(offset, 0, 0)
+        CATransaction.commit()
+        // Arms at the reply point and only disarms well short of it, so it can't flutter.
+        let armed = swipeArmed ? travel >= Self.replyTravel * 0.75 : travel >= Self.replyTravel
+        if armed != swipeArmed {
+            swipeArmed = armed
+            if armed { Haptic.arm() }
+        }
+        placeReplyIcon(offset: offset, armed: armed)
+    }
+
+    /// 1:1 up to the reply point, then it resists; the other way there's nothing to reveal,
+    /// so it barely gives.
+    static func swipeOffset(_ travel: CGFloat) -> CGFloat {
+        func band(_ x: CGFloat, _ d: CGFloat) -> CGFloat { x * d * 0.55 / (d + 0.55 * x) }
+        if travel <= 0 { return -band(-travel, 24) }
+        if travel <= replyTravel { return travel }
+        return replyTravel + band(travel - replyTravel, 90)
+    }
+
+    /// The message's speed at release, in points per second.
+    private var swipeVelocity: CGFloat {
+        guard let a = swipeSamples.first, let b = swipeSamples.last, b.t - a.t > 0.001 else { return 0 }
+        let v = (b.travel - a.travel) / CGFloat(b.t - a.t)
+        return (swipeTravel ?? 0) > Self.replyTravel ? v * 0.4 : v
+    }
+
+    private func endSwipe(commit: Bool, velocity v: CGFloat, animated: Bool) {
+        touchPending = false
+        guard let travel = swipeTravel else { return }
+        swipeTravel = nil
+        swipeArmed = false
+        let offset = Self.swipeOffset(travel)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.sublayerTransform = CATransform3DIdentity
+        CATransaction.commit()
+        if animated, !Theme.reduceMotion, abs(offset) > 0.5 {
+            // Home on a spring that keeps the fingers' speed, with a little give: the gesture
+            // carried momentum.
+            let s = Theme.spring("sublayerTransform", response: 0.36, damping: 0.72)
+            s.fromValue = CATransform3DMakeTranslation(offset, 0, 0)
+            s.toValue = CATransform3DIdentity
+            s.initialVelocity = min(20, max(-20, -v / offset))
+            s.duration = s.settlingDuration
+            layer?.add(s, forKey: "swipeBack")
+        }
+        if let icon = replyIcon {
+            replyIcon = nil
+            if animated { icon.dismiss() } else { icon.removeFromSuperview() }
+        }
+        if commit, let m = item?.msg { controller?.reply(to: m) }
+    }
+
+    private func placeReplyIcon(offset: CGFloat, armed: Bool) {
+        guard let row = superview, let item else { return }
+        let icon: ReplyIconView
+        if let i = replyIcon {
+            icon = i
+        } else {
+            icon = ReplyIconView()
+            row.addSubview(icon, positioned: .below, relativeTo: self)
+            replyIcon = icon
+        }
+        // Centred in the room the message leaves behind, a little toward the edge it left.
+        let block = item.tapbackBlock ?? item.frame
+        let side = ReplyIconView.side
+        let c = CGPoint(x: block.minX + max(0, offset) / 2 - 8, y: block.midY)
+        icon.frame = convert(NSRect(x: c.x - side / 2, y: c.y - side / 2, width: side, height: side), to: row)
+        icon.update(progress: offset / Self.replyTravel, armed: armed)
+    }
+
     override func resetCursorRects() {
         guard let item else { return }
         if let m = item.mediaRect { addCursorRect(m, cursor: .pointingHand) }
         if let c = item.cardRect { addCursorRect(c, cursor: .pointingHand) }
         if let f = item.failedRect { addCursorRect(f, cursor: .pointingHand) }
         for r in item.richClickRects { addCursorRect(r, cursor: .pointingHand) }
+    }
+}
+
+/// The reply arrow revealed behind a message being swiped: it grows in with the swipe and
+/// fills with the accent once letting go will reply.
+final class ReplyIconView: NSView {
+    static let side: CGFloat = 30
+    /// Hand-made layers (centre-anchored, unlike a view's), so they scale about their middle.
+    private let body = CALayer()
+    private let disc = CALayer()
+    private let glyph = CALayer()
+    private var armed = false
+
+    override init(frame: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.side, height: Self.side))
+        wantsLayer = true
+        let b = CGRect(x: 0, y: 0, width: Self.side, height: Self.side)
+        body.frame = b
+        disc.frame = b
+        disc.cornerRadius = Self.side / 2
+        glyph.frame = b
+        glyph.contentsGravity = .center
+        body.addSublayer(disc)
+        body.addSublayer(glyph)
+        layer?.addSublayer(body)
+        applyColors()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            disc.backgroundColor = (armed ? Theme.accent : NSColor.labelColor.withAlphaComponent(0.1)).cgColor
+            let tint = armed ? NSColor.white : NSColor.secondaryLabelColor
+            let img = NSImage(systemSymbolName: "arrowshape.turn.up.left.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold).applying(.init(paletteColors: [tint])))
+            let scale = window?.backingScaleFactor ?? 2
+            glyph.contents = img?.layerContents(forContentsScale: scale)
+            glyph.contentsScale = scale
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    func update(progress p: CGFloat, armed: Bool) {
+        let k = min(1, max(0, p))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        body.opacity = Float(k)
+        body.transform = CATransform3DMakeScale(0.5 + 0.5 * k, 0.5 + 0.5 * k, 1)
+        CATransaction.commit()
+        guard armed != self.armed else { return }
+        self.armed = armed
+        applyColors()
+        guard armed, !Theme.reduceMotion else { return }
+        let s = Theme.spring("transform", response: 0.3, damping: 0.5)
+        s.fromValue = CATransform3DMakeScale(1.25, 1.25, 1)
+        s.toValue = CATransform3DIdentity
+        body.add(s, forKey: "arm")
+    }
+
+    /// Fades as the message springs home, then goes.
+    func dismiss() {
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            MainActor.assumeIsolated { self?.removeFromSuperview() }
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = body.opacity
+        fade.toValue = 0
+        fade.duration = 0.15
+        fade.timingFunction = Theme.easeOut
+        body.opacity = 0
+        body.add(fade, forKey: "out")
+        CATransaction.commit()
     }
 }
 

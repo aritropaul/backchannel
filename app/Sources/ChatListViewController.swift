@@ -120,6 +120,12 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     private let scrollView: NSScrollView = ChatListScrollView()
     let tableView = NSTableView()
     private let pinnedGrid = PinnedGridView()
+    /// The pull's progress ring, in the gap the rubber band opens above the list.
+    private let pullIndicator = PullIndicator()
+    /// Something is archived or locked, so a pull has something to show (read once per gesture).
+    private var pullHasHidden = false
+    /// Rows the next list change slides in instead of fading (Archived, from a pull).
+    private var slideIn: Set<String> = []
 
     init(store: Store) {
         self.store = store
@@ -200,7 +206,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         scrollView.wantsLayer = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        [search, filters, status, scrollView].forEach(v.addSubview)
+        [search, filters, status, scrollView, pullIndicator].forEach(v.addSubview)
         let statusHeight = status.heightAnchor.constraint(equalToConstant: 0)
         statusHeight.identifier = "statusHeight"
         NSLayoutConstraint.activate([
@@ -238,13 +244,38 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
                                                queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.hideArchiveIfScrolledAway() }
         }
+        // The ring rides the rubber band, including its spring back after the fingers lift.
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updatePullIndicator() }
+        }
     }
 
     override func viewDidLayout() {
         super.viewDidLayout()
         let narrow = view.bounds.width < Self.compactBelow
         if narrow != compact { setCompact(narrow) }
+        updatePullIndicator()
     }
+
+    /// How far the list is pulled down past its top.
+    private var pullStretch: CGFloat {
+        max(0, -(scrollView.contentView.bounds.minY + scrollView.contentInsets.top))
+    }
+
+    private func updatePullIndicator() {
+        let stretch = pullStretch
+        let shown = pullHasHidden && !archiveRevealed && !showingArchived && !showingLocked && isPlain && stretch > 0
+        let side = PullIndicator.side
+        // Centred in the gap, which grows from the list's top edge.
+        let top = scrollView.frame.maxY - scrollView.contentInsets.top
+        pullIndicator.frame = NSRect(x: scrollView.frame.midX - side / 2, y: top - stretch / 2 - side / 2, width: side, height: side)
+        pullIndicator.update(stretch: shown ? stretch : 0, progress: (pullDistance ?? lastPull) / Self.pullTravel, armed: pullArmed)
+    }
+
+    /// The last gesture's travel, so the ring doesn't empty while the list springs back.
+    private var lastPull: CGFloat = 0
 
     /// Messages' compact sidebar: no search or filter, pinned chats first as plain
     /// avatars, a short rule, then everything else.
@@ -269,9 +300,9 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     /// so fast that one deliberate pull stretches it only 15–40pt. Only a gesture that
     /// starts at the top counts and momentum never does, so scrolling or flinging up to the
     /// top doesn't open it by accident.
-    private func trackPull(_ e: NSEvent) {
-        guard e.window === view.window, !archiveRevealed, !showingArchived, !showingLocked, isPlain,
-              scrollView.bounds.contains(scrollView.convert(e.locationInWindow, from: nil)) else {
+    private func trackPull(_ e: NSEvent, synthetic: Bool = false) {
+        guard synthetic || (e.window === view.window && scrollView.bounds.contains(scrollView.convert(e.locationInWindow, from: nil))),
+              !archiveRevealed, !showingArchived, !showingLocked, isPlain else {
             pullArmed = false
             pullDistance = nil
             return
@@ -281,27 +312,63 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         case .began:
             pullArmed = false
             pullDistance = atTop ? 0 : nil
+            lastPull = 0
+            if atTop { pullHasHidden = store.archivedSummary().count > 0 || !ChatPrefs.locked.isEmpty }
         case .changed:
             guard let d = pullDistance else { return }
             let travel = atTop ? max(0, d + e.scrollingDeltaY) : 0
             pullDistance = travel
+            lastPull = travel
             if pullArmed, travel < Self.pullTravel / 2 {
                 pullArmed = false
-            } else if !pullArmed, travel >= Self.pullTravel,
-                      store.archivedSummary().count > 0 || !ChatPrefs.locked.isEmpty {
+            } else if !pullArmed, travel >= Self.pullTravel, pullHasHidden {
                 pullArmed = true
-                NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+                Haptic.arm()
             }
+            updatePullIndicator()
         case .ended:
             pullDistance = nil
-            guard pullArmed else { return }
+            guard pullArmed else { updatePullIndicator(); return }
             pullArmed = false
             revealArchive()
         case .cancelled:
             pullArmed = false
             pullDistance = nil
+            updatePullIndicator()
         default:
             break
+        }
+    }
+
+    // MARK: dev (WA_MOMENTS)
+
+    /// A deliberate pull from the top, through the same path as the trackpad's.
+    func debugPull() {
+        let clip = scrollView.contentView
+        clip.scroll(to: NSPoint(x: 0, y: -scrollView.contentInsets.top))
+        scrollView.reflectScrolledClipView(clip)
+        let r = view.window.map { $0.convertToScreen(scrollView.convert(scrollView.bounds, to: nil)) } ?? .zero
+        var steps: [DevMoments.Step] = [(.began, 0, 6)]
+        steps += Array(repeating: (.changed, 0, 7), count: 40)
+        steps += Array(repeating: (.changed, 0, 0), count: 20)
+        steps.append((.ended, 0, 0))
+        DevMoments.play(steps, at: CGPoint(x: r.midX, y: r.maxY - 60), into: { [weak self] e in
+            self?.trackPull(e, synthetic: true)
+            self?.scrollView.scrollWheel(with: e)
+        })
+    }
+
+    /// A visible read chat shows an unread dot for two seconds (the view only).
+    func debugDot() {
+        let range = tableView.rows(in: tableView.visibleRect)
+        for i in range.location..<min(items.count, range.location + range.length) {
+            guard case .chat(let c) = items[i], !c.hasUnread,
+                  let cell = tableView.view(atColumn: 0, row: i, makeIfNecessary: false) as? ChatCellView else { continue }
+            let unread = Chat(jid: c.jid, name: c.name, isGroup: c.isGroup, lastTS: c.lastTS, unread: 1, markedUnread: false,
+                              pinned: c.pinned, archived: c.archived, mutedUntil: c.mutedUntil, avatar: c.avatar, last: c.last)
+            cell.configure(unread, typing: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2 * Motion.slow) { cell.configure(c, typing: false) }
+            return
         }
     }
 
@@ -309,7 +376,11 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
     func revealArchive() {
         guard !archiveRevealed else { return }
         archiveRevealed = true
+        updatePullIndicator()
+        // Archived drops in from under the header, where the pull came from.
+        slideIn = ["~archived", "~locked"]
         rebuildItems(animated: true)
+        slideIn = []
     }
 
     /// Once Archived has scrolled out of sight and the scroll settles, it hides again
@@ -434,7 +505,7 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         }
         for (i, k) in newKeys.enumerated() where !oldSet.contains(k) {
             let pos = min(i, current.count)
-            tableView.insertRows(at: IndexSet(integer: pos), withAnimation: .effectFade)
+            tableView.insertRows(at: IndexSet(integer: pos), withAnimation: slideIn.contains(k) ? [.slideDown, .effectFade] : .effectFade)
             current.insert(k, at: pos)
         }
         for i in 0..<newKeys.count where current[i] != newKeys[i] {

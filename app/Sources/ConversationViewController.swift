@@ -154,6 +154,10 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
     private var pendingOpen: String?
     private var previewURL: URL?
     private var highlighted: String?
+    /// Reactions of mine still flying from the menu to their message (message id → emoji).
+    private(set) var landing: [String: String] = [:]
+    /// The transcript is scrolling or coasting (a touch then belongs to the scroll view).
+    private(set) var isScrolling = false
 
     private let scrollView = NSScrollView()
     let tableView = NSTableView()
@@ -255,6 +259,14 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged),
                                                name: NSView.frameDidChangeNotification, object: scrollView)
         scrollView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSScrollView.willStartLiveScrollNotification, object: scrollView,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.isScrolling = true }
+        }
+        NotificationCenter.default.addObserver(forName: NSScrollView.didEndLiveScrollNotification, object: scrollView,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.isScrolling = false }
+        }
     }
 
     private var insets: NSEdgeInsets { scrollView.contentInsets }
@@ -683,6 +695,7 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         t.toValue = CATransform3DIdentity
         layer.add(t, forKey: "enter")
         Motion.fade(layer, from: sent ? 0.4 : 0, duration: 0.2)
+        (v as? BubbleView)?.beatIfHeart()
     }
 
     private func restore(_ scroll: Scroll, anchor: (id: String, offset: CGFloat)?) {
@@ -949,12 +962,57 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         highlighted = id
         rebuildAndReload(.none)
         restore(.message(id), anchor: nil)
+        // Once the scroll has brought it to the middle, the message says "here".
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.highlighted == id, let row = self.rowIndex(of: id) else { return }
+            (self.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView)?.nudge()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             guard let self, self.highlighted == id else { return }
             self.highlighted = nil
             if let row = self.rowIndex(of: id), let v = self.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView {
-                v.highlight = false
+                v.fadeHighlight()
             }
+        }
+    }
+
+    // MARK: dev (WA_MOMENTS): the moments played on screen; nothing reaches the core.
+
+    private func cell(for id: String) -> BubbleView? {
+        guard let row = rowIndex(of: id) else { return nil }
+        return tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView
+    }
+
+    /// A reaction flying in from where the menu's strip would be (below and right of the
+    /// message, as a right-click opens it).
+    func debugFlight(id: String, emoji: String) {
+        guard let cell = cell(for: id), let window = view.window, let b = cell.item?.tapbackBlock else { return }
+        let block = window.convertToScreen(cell.convert(b, to: nil))
+        flyReaction(id, emoji, from: NSRect(x: block.midX + 40, y: block.minY - 80, width: 38, height: 38),
+                    size: ReactionStripView.glyphSize)
+    }
+
+    /// The heartbeat on any message, to check its motion where no lone heart is on screen.
+    func debugBeat(id: String) {
+        guard let cell = cell(for: id), let b = cell.item?.tapbackBlock else { return }
+        Motion.heartbeat(cell.layer, about: CGPoint(x: b.midX, y: b.midY), delay: 0)
+    }
+
+    func debugEntrance(id: String) {
+        guard let cell = cell(for: id), let m = cell.item?.msg else { return }
+        animateEntrance(cell, sent: m.fromMe)
+    }
+
+    /// A two-finger swipe across the message, then the reply it sets up is cancelled.
+    func debugSwipe(id: String) {
+        guard let cell = cell(for: id), let window = view.window, let b = cell.item?.tapbackBlock else { return }
+        let r = window.convertToScreen(cell.convert(b, to: nil))
+        var steps: [DevMoments.Step] = [(.mayBegin, 0, 0), (.began, 2, 0.2)]
+        steps += Array(repeating: (.changed, 3.2, 0.1), count: 30)
+        steps += Array(repeating: (.changed, 0, 0), count: 12)
+        steps.append((.ended, 0, 0))
+        DevMoments.play(steps, at: CGPoint(x: r.midX, y: r.midY), into: { cell.scrollWheel(with: $0) }) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6 * Motion.slow) { self?.composerCancelReply() }
         }
     }
 
@@ -1037,9 +1095,9 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         if live {
             let mine = m.reactions?.mine
             let strip = ReactionStripView(recent: EmojiCatalog.recent, mine: mine?.isEmpty == false ? mine : nil,
-                                          onPick: { [weak self] e in
+                                          onPick: { [weak self] e, from in
                                               EmojiCatalog.used(e)
-                                              self?.react(m, e == mine ? "" : e)
+                                              if e == mine { self?.react(m, "") } else { self?.react(m, e, from: from, size: ReactionStripView.glyphSize) }
                                           },
                                           onMore: { [weak self] in self?.pickReaction(for: m) })
             let header = NSMenuItem()
@@ -1102,14 +1160,36 @@ final class ConversationViewController: NSViewController, NSTableViewDataSource,
         pop.contentSize = ReactionPickerViewController.size
         picker.onPick = { [weak self, weak pop] e in
             EmojiCatalog.used(e)
-            self?.react(m, e)
+            // From the cell that was clicked, which is under the pointer.
+            let at = NSEvent.mouseLocation
+            self?.react(m, e, from: NSRect(x: at.x - 14, y: at.y - 14, width: 28, height: 28), size: 26)
             pop?.performClose(nil)
         }
         pop.show(relativeTo: anchor, of: cell, preferredEdge: .maxY)
     }
 
-    private func react(_ m: Message, _ emoji: String) {
+    /// `from` (screen coordinates) is where the emoji was picked; it flies from there to
+    /// the message and lands as the badge.
+    private func react(_ m: Message, _ emoji: String, from: CGRect? = nil, size: CGFloat = 0) {
+        if let from, !emoji.isEmpty { flyReaction(m.id, emoji, from: from, size: size) }
         Core.shared.call("react", ["chat": chat?.jid ?? "", "id": m.id, "emoji": emoji])
+    }
+
+    private func flyReaction(_ id: String, _ emoji: String, from: CGRect, size: CGFloat) {
+        guard !Theme.reduceMotion, let window = view.window else { return }
+        landing[id] = emoji
+        ReactionFlight.fly(emoji, from: from, size: size, over: window, to: { [weak self] in
+            guard let self, let row = self.rowIndex(of: id),
+                  let cell = self.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView,
+                  let r = cell.reactionLanding(for: emoji) else { return nil }
+            return window.convertToScreen(r)
+        }, landed: { [weak self] in
+            guard let self else { return }
+            self.landing[id] = nil
+            if let row = self.rowIndex(of: id) {
+                (self.tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView)?.landReaction()
+            }
+        })
     }
 
     private func beginEdit(_ m: Message) {
