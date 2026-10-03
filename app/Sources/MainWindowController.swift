@@ -57,6 +57,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         split.addSplitViewItem(content)
         split.addSplitViewItem(profileItem)
         split.splitView.autosaveName = "WA.MainSplit"
+        split.onResize = { [weak self] in self?.noteSidebarResize() }
 
         list.delegate = self
         convo.onHeader = { [weak self] title, sub in
@@ -419,6 +420,43 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         }
     }
 
+    func windowDidResize(_ notification: Notification) { noteWindowResize() }
+
+    // MARK: sidebar widening the window
+
+    /// Window frame from before opening the sidebar out of the compact column made AppKit
+    /// grow the window (it keeps the conversation's width). Folding the sidebar back puts
+    /// the window back, like closing the contact panel does; otherwise every out-and-back
+    /// left it wider.
+    private var frameBeforeSidebar: NSRect?
+    /// The window's frame the last time it was seen with the sidebar compact.
+    private var compactFrame: NSRect?
+
+    private var sidebarIsCompact: Bool { sidebarPosition <= MainSplitViewController.compactPosition + 0.5 }
+
+    private func noteWindowResize() {
+        guard let w = window, isShowingMain else { return }
+        if w.inLiveResize {
+            frameBeforeSidebar = nil   // sized by hand: that's the size to keep
+        } else if !sidebarIsCompact, frameBeforeSidebar == nil, let c = compactFrame, w.frame.width > c.width + 0.5 {
+            frameBeforeSidebar = c
+        }
+        if sidebarIsCompact { compactFrame = w.frame }
+    }
+
+    private func noteSidebarResize() {
+        guard let w = window, isShowingMain, sidebarIsCompact else { return }
+        if let before = frameBeforeSidebar, !w.inLiveResize {
+            frameBeforeSidebar = nil
+            var f = w.frame
+            f.origin.x = before.origin.x
+            f.size.width = before.width
+            DispatchQueue.main.async { w.setFrame(f, display: true, animate: false) }
+        } else {
+            compactFrame = w.frame
+        }
+    }
+
     /// Narrowing the window squeezes the sidebar once the conversation is at its minimum.
     /// When the resize ends, a sidebar caught between the two layouts settles on one:
     /// the full list if the window still has room for it, otherwise the compact column.
@@ -485,6 +523,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
 /// The sidebar never closes, as in Messages. Dragged narrower than the full list it
 /// snaps to the compact avatar column, and back out once dragged past halfway.
 final class MainSplitViewController: NSSplitViewController {
+    /// Called after every subview resize (the window controller puts back the width the
+    /// sidebar took).
+    var onResize: (() -> Void)?
+
+    override func splitViewDidResizeSubviews(_ notification: Notification) {
+        super.splitViewDidResizeSubviews(notification)
+        onResize?()
+    }
+
     // NSSplitViewController declares this but doesn't implement it, so there's no super to call.
     override func splitView(_ splitView: NSSplitView, constrainSplitPosition proposed: CGFloat, ofSubviewAt index: Int) -> CGFloat {
         index == 0 ? Self.snap(proposed) : proposed

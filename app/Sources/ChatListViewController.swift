@@ -143,7 +143,16 @@ final class ChatListViewController: NSViewController, NSTableViewDataSource, NST
         status.font = .systemFont(ofSize: 11)
         status.textColor = .secondaryLabelColor
         status.alignment = .center
+        status.lineBreakMode = .byTruncatingTail
         status.translatesAutoresizingMaskIntoConstraints = false
+        // The header must never widen the sidebar. At the default 750, the status line
+        // ("Connecting…", "Loading your chats…") and the search field out-pull the split
+        // view's hold on the divider (about 250), so they shoved the sidebar past the compact
+        // column and the window grew to make room, a few points every launch and more on
+        // longer notes. Below that hold they truncate instead.
+        for v in [search, filters, status] as [NSView] {
+            v.setContentCompressionResistancePriority(.init(200), for: .horizontal)
+        }
 
         pinnedGrid.onSelect = { [weak self] c in self?.select(jid: c.jid) }
         pinnedGrid.onMenu = { c in
