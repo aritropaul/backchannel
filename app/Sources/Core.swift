@@ -43,9 +43,7 @@ final class Core {
             return
         }
         isPreview = false
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        dataDir = base.appendingPathComponent("WA", isDirectory: true)
+        dataDir = AppPaths.dataDir
     }
 
     var dbPath: String { dataDir.appendingPathComponent("app.db").path }

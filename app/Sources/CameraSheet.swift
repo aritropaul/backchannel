@@ -127,7 +127,7 @@ final class CameraViewController: NSViewController {
     }
 
     private func denied() {
-        notice.stringValue = "WA can't use the camera. Turn it on in System Settings › Privacy & Security › Camera."
+        notice.stringValue = "\(Brand.name) can't use the camera. Turn it on in System Settings › Privacy & Security › Camera."
         notice.isHidden = false
         settingsButton.isHidden = false
         shutter.isEnabled = false

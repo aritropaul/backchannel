@@ -62,7 +62,7 @@ enum Theme {
 
         var title: String {
             switch self {
-            case .whatsapp: "WhatsApp Green"
+            case .whatsapp: "Classic Green"
             case .system: "Match System"
             default: rawValue.capitalized
             }

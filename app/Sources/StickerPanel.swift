@@ -60,7 +60,7 @@ enum StickerLibrary {
 // MARK: - GIF search (GIPHY)
 
 /// GIF search and trending through GIPHY. The API key is yours, in a private file in
-/// WA's data folder (giphy.key, mode 600), or GIPHY_API_KEY in the environment; none
+/// the app's data folder (giphy.key, mode 600), or GIPHY_API_KEY in the environment; none
 /// ships with the app. Not the Keychain: an ad-hoc signed app is a new app to the
 /// Keychain after every build, so it asked for the password each launch.
 enum GIFSearch {
@@ -73,8 +73,7 @@ enum GIFSearch {
     }
 
     private static var keyFile: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("WA/giphy.key")
+        AppPaths.dataDir.appendingPathComponent("giphy.key")
     }
 
     static var key: String? {

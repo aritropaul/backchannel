@@ -582,7 +582,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
             guard ok else {
                 let a = NSAlert()
                 a.messageText = "Microphone access is off"
-                a.informativeText = "Allow WA in System Settings → Privacy & Security → Microphone to record voice messages."
+                a.informativeText = "Allow \(Brand.name) in System Settings → Privacy & Security → Microphone to record voice messages."
                 if let w = self.window { a.beginSheetModal(for: w) } else { a.runModal() }
                 return
             }

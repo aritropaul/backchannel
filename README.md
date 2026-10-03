@@ -1,19 +1,22 @@
-# WA
+# Backchannel
 
-A native macOS 26 WhatsApp client. The UI is AppKit; the protocol layer is [whatsmeow](https://github.com/tulir/whatsmeow), linked in as a Go c-archive. It links to your phone as a companion device, the same way WhatsApp Web does.
+A native Mac app for WhatsApp (unofficial; not affiliated with WhatsApp or Meta). macOS 26. The UI is AppKit; the protocol layer is [whatsmeow](https://github.com/tulir/whatsmeow), linked in as a Go c-archive. It links to your phone as a companion device, the same way WhatsApp Web does.
 
 > Unofficial client: WhatsApp can ban accounts it sees using third-party clients. whatsmeow uses the official multi-device companion protocol, which is lower risk, but the risk isn't zero.
 
 ## Build and run
 
 ```sh
-make          # Go core (c-archive) + Xcode Release build -> build/WA.app
+make          # Go core (c-archive) + Xcode Release build -> build/Backchannel.app
 make run      # build and open
+make dmg      # build/Backchannel-<version>.dmg with the branded window (needs create-dmg)
 ```
 
-Requirements: Xcode 26, Go 1.26, xcodegen (`brew install xcodegen`). `make project` regenerates `app/WA.xcodeproj` from `app/project.yml`.
+Requirements: Xcode 26, Go 1.26, xcodegen (`brew install xcodegen`). `make project` regenerates `app/Backchannel.xcodeproj` from `app/project.yml`. The app icon is an Icon Composer document, `app/Icon/Backchannel.icon`.
 
-On first launch, scan the QR code from your phone (Settings → Linked Devices → Link a Device) or use "Link with phone number instead". Your data lives in `~/Library/Application Support/WA/` (`session.db` holds the keys, `app.db` holds chats and messages, plus `media/`, `avatars/` and `core.log`).
+On first launch, scan the QR code from your phone (Settings → Linked Devices → Link a Device) or use "Link with phone number instead". Your data lives in `~/Library/Application Support/Backchannel/` (`session.db` holds the keys, `app.db` holds chats and messages, plus `media/`, `avatars/` and `core.log`).
+
+Coming from a build named WA: the first launch quits if WA is still running, then copies WA's settings, backs up `session.db` and `app.db` to `Application Support/Backchannel backup <date>/`, moves the data folder, and repoints the stored file paths (avatars, media, stickers). The phone stays linked.
 
 ## Architecture
 
@@ -34,7 +37,7 @@ core/ (Go, -buildmode=c-archive)        app/Sources (Swift, AppKit)
 
 ```sh
 python3 tools/make_preview_db.py build/preview
-WA_PREVIEW_DIR=$PWD/build/preview build/WA.app/Contents/MacOS/WA          # synthetic chats, no network
+WA_PREVIEW_DIR=$PWD/build/preview build/Backchannel.app/Contents/MacOS/Backchannel          # synthetic chats, no network
 WA_PREVIEW_DEMO=1 WA_SLOWMO=6 WA_PREVIEW_DIR=...                           # scripted send/typing/reply/tapback, 6× slow motion
 ```
 

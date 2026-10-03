@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>WA</string>
+	<string>Backchannel</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,13 +25,15 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSCameraUsageDescription</key>
-	<string>WA uses the camera to take photos you send.</string>
+	<string>Backchannel uses the camera to take photos you send.</string>
 	<key>NSCameraUseContinuityCameraDeviceType</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WA uses the microphone to record voice messages.</string>
+	<string>Backchannel uses the microphone to record voice messages.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Saves photos and videos from chats you set to Save to Photos.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Unofficial. Not affiliated with WhatsApp or Meta.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>
