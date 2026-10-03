@@ -26,7 +26,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
-        window.title = "WA"
+        window.title = Brand.name
         window.titleVisibility = .hidden   // the conversation header replaces the title
         // The sidebar folds to the compact column, so the window can get as narrow as Messages'.
         window.minSize = NSSize(width: MainSplitViewController.compactPosition + Self.contentMinWidth, height: 480)
@@ -130,9 +130,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
 
     func showMain() {
         guard window?.contentViewController !== split else { return }
+        let leaving = pairing
         pairing = nil
         let frame = window?.frame
         window?.contentViewController = split
+        if leaving != nil { setPairingChrome(false) }
         // The split autosave would restore an open (empty) profile panel; always start closed.
         profileItem.isCollapsed = true
         setCloseProfileShown(false)
@@ -144,7 +146,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
            env != nil || !ChatPrefs.isLocked(last) {
             list.select(jid: last)
         }
+        // The QR screen fades away over the chats rather than cutting to them.
+        leaving?.dissolve(over: split.view)
     }
+
+    /// While the QR screen's intro plays, the window waits offscreen; the intro shows it.
+    private var intro: PairingIntro?
 
     func showPairing() {
         if pairing == nil {
@@ -154,13 +161,66 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             convo.open(nil)
             window?.contentViewController = p
             window?.toolbar?.isVisible = false
-            window?.title = "WA"
+            window?.title = Brand.name
             window?.subtitle = ""
             if let frame { window?.setFrame(frame, display: true) }
+            setPairingChrome(true)
+            // The screen frosts over and the light flows into this window (see PairingIntro).
+            guard let w = window, !Theme.reduceMotion, ProcessInfo.processInfo.environment["WA_NO_INTRO"] == nil else { return }
+            w.orderOut(nil)
+            p.lightIsUp = true
+            let i = PairingIntro(target: w.frame, screen: w.screen ?? NSScreen.main)
+            intro = i
+            i.play(handOff: {
+                NSApp.activate()
+                w.makeKeyAndOrderFront(nil)
+            }, done: { [weak self] in self?.intro = nil })
+        }
+    }
+
+    override func showWindow(_ sender: Any?) {
+        guard intro == nil else { return }
+        super.showWindow(sender)
+    }
+
+    private var mainMinSize: NSSize?
+
+    /// The QR screen runs edge to edge in this window: no title bar fill, draggable
+    /// anywhere, and at least big enough for the card and the steps.
+    private func setPairingChrome(_ on: Bool) {
+        guard let w = window else { return }
+        w.titlebarAppearsTransparent = on
+        w.isMovableByWindowBackground = on
+        if on {
+            mainMinSize = w.minSize
+            let need = NSSize(width: 900, height: 720)
+            w.contentMinSize = need
+            let content = w.contentRect(forFrameRect: w.frame).size
+            if content.width < need.width || content.height < need.height {
+                let grow = NSSize(width: max(0, need.width - content.width), height: max(0, need.height - content.height))
+                let f = NSRect(x: w.frame.minX - grow.width / 2, y: w.frame.minY - grow.height / 2,
+                               width: w.frame.width + grow.width, height: w.frame.height + grow.height)
+                w.setFrame(w.constrainFrameRect(f, to: w.screen), display: true)
+            }
+        } else if let m = mainMinSize {
+            w.contentMinSize = .zero
+            w.minSize = m
         }
     }
 
     var isShowingMain: Bool { window?.contentViewController === split }
+
+    /// Dev (WA_PAIRING_PREVIEW=screen or flow, preview mode only): the QR screen in this
+    /// window with a sample code; with `linkAfter`, then the linked beat and the dissolve into
+    /// the chats. Nothing touches the account.
+    func previewPairingFlow(code: String, linkAfter delay: Double? = nil) {
+        showPairing()
+        pairing?.show(qr: code)
+        guard let delay else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.pairing?.celebrate { [weak self] in self?.showMain() }
+        }
+    }
 
     // MARK: core events
 
@@ -170,9 +230,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
             switch s {
             case "connected":
                 connectionNote = nil
-                if pairing != nil && Core.shared.isPaired { showMain() }
+                if let p = pairing, Core.shared.isPaired, !p.isCelebrating { showMain() }
             case "syncing":
-                showMain()
+                // Just linked: let the first-run screen land its success beat, then the chats.
+                if let p = pairing {
+                    p.celebrate { [weak self] in self?.showMain() }
+                } else {
+                    showMain()
+                }
                 syncNote = "Loading your chats…"
             case "connecting":
                 connectionNote = "Connecting…"

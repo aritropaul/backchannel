@@ -30,7 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         core.observe { [weak self] e in self?.handle(e) }
 
         // Paired: paint straight from the local store, before the network.
-        if core.isPaired { main.showMain() } else { main.showPairing() }
+        // Dev: WA_PAIRING_PREVIEW=screen opens straight into the QR screen (preview mode only).
+        let qrPreview = core.isPreview && ProcessInfo.processInfo.environment["WA_PAIRING_PREVIEW"] == "screen"
+        if core.isPaired && !qrPreview { main.showMain() } else { main.showPairing() }
         main.showWindow(nil)
         updateBadge()
         // Dev affordances: WA_SLOWMO=<n> slows every animation n×; WA_PREVIEW_DEMO plays a scripted chat.
@@ -86,6 +88,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 }
                 RunLoop.main.add(t, forMode: .common)
                 c.showAttachMenu(from: c.composer.attachAnchor)
+            }
+        }
+        if let size = env["WA_WINDOW_SIZE"], let w = main.window {
+            // Dev: e.g. WA_WINDOW_SIZE=1240x780, for screenshots (preview mode only; nothing is saved).
+            let p = size.split(separator: "x").compactMap { Double($0) }
+            if p.count == 2 { w.setContentSize(NSSize(width: p[0], height: p[1])); w.center() }
+        }
+        if let n = env["WA_OPEN_INDEX"].flatMap(Int.init) {
+            // Dev: opens the nth chat in the list (0-based), like ⌘1…⌘9.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.selectNth(n) }
+        }
+        if env["WA_ABOUT"] != nil {
+            // Dev: the About window, opened at launch.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { AboutWindowController.shared.present() }
+        }
+        if let stage = env["WA_PAIRING_PREVIEW"], stage == "flow" || stage == "screen", core.isPreview {
+            let fake = { (n: Int) in String((0..<n).map { _ in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".randomElement()! }) }
+            let code = "2@" + fake(78) + "," + fake(43) + "=," + fake(43) + "=," + fake(43) + "="
+            if stage == "screen" {
+                main.previewPairingFlow(code: code)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak main] in main?.previewPairingFlow(code: code, linkAfter: 7) }
+            }
+        } else if let stage = env["WA_PAIRING_PREVIEW"] {
+            // Dev: the first-run screen in its own window, without logging out. The code has a
+            // real code's length but random keys, so it links nothing. Stages: loading, qr
+            // (default), rotate, expired, offline, phone, linked.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let vc = PairingViewController()
+                let w = NSWindow(contentViewController: vc)
+                w.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
+                w.titlebarAppearsTransparent = true
+                w.titleVisibility = .hidden
+                w.isMovableByWindowBackground = true
+                w.setContentSize(NSSize(width: 1120, height: 760))
+                w.title = "Pairing preview"
+                let fake = { (n: Int) in String((0..<n).map { _ in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".randomElement()! }) }
+                let code = { "2@" + fake(78) + "," + fake(43) + "=," + fake(43) + "=," + fake(43) + "=" }
+                if stage != "loading" { vc.show(qr: code()) }
+                w.center()
+                w.makeKeyAndOrderFront(nil)
+                objc_setAssociatedObject(NSApp as Any, "pairingPreview", w, .OBJC_ASSOCIATION_RETAIN)
+                let later = { (t: Double, f: @escaping () -> Void) in DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) }
+                switch stage {
+                case "rotate": later(2.5) { vc.show(qr: code()) }
+                case "expired": later(1.6) { vc.show(state: "qr_timeout", message: nil) }
+                case "offline": later(1.6) { vc.show(state: "offline", message: nil) }
+                case "phone": later(1.6) { vc.perform(Selector(("toggleMode"))) }
+                case "linked": later(1.6) { vc.celebrate {} }
+                default: break
+                }
             }
         }
         if let which = env["WA_SHEET"] {
@@ -408,7 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let content = UNMutableNotificationContent()
         // A locked chat never shows who or what, only that something arrived.
         let locked = ChatPrefs.isLocked(chat)
-        content.title = locked ? "WA" : title
+        content.title = locked ? Brand.name : title
         content.body = Prefs.notifyPreviews && !locked ? body : "New message"
         content.threadIdentifier = locked ? "locked" : chat
         content.userInfo = ["chat": locked ? "" : chat]
@@ -442,6 +495,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: menu actions
 
     @objc func newMessage(_ sender: Any?) { wc?.newMessage(sender) }
+    @objc private func showAbout(_ sender: Any?) {
+        AboutWindowController.shared.present()
+    }
+
     @objc func showSettings(_ sender: Any?) {
         guard let store else { return }
         if settings == nil { settings = SettingsWindowController(store: store) }
@@ -507,18 +564,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return i
         }
 
-        _ = menu("WA", [
-            item("About WA", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
+        _ = menu(Brand.name, [
+            item("About \(Brand.name)", #selector(showAbout(_:)), target: self),
             .separator(),
             item("Settings…", #selector(showSettings(_:)), ",", target: self),
             .separator(),
             item("Log Out of WhatsApp…", #selector(logOut(_:)), target: self),
             .separator(),
-            item("Hide WA", #selector(NSApplication.hide(_:)), "h"),
+            item("Hide \(Brand.name)", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
             item("Show All", #selector(NSApplication.unhideAllApplications(_:))),
             .separator(),
-            item("Quit WA", #selector(NSApplication.terminate(_:)), "q"),
+            item("Quit \(Brand.name)", #selector(NSApplication.terminate(_:)), "q"),
         ])
         _ = menu("File", [
             item("New Message", #selector(newMessage(_:)), "n", target: self),
