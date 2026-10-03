@@ -3,10 +3,9 @@
 #   make dmg      the app in a disk image, build/Backchannel-<version>.dmg
 #   make run      build and launch
 #   make core     just the Go c-archive
-#   VERSION=0.2.0 BUILD=12 make dmg   stamp a version (releases do this from the tag)
+#   VERSION=0.2.0 BUILD=12 make dmg   stamp a version
 #
-# Releases: push a tag like v0.2.0 and .github/workflows/release.yml builds, signs and
-# notarizes (when the Developer ID secrets are set) and publishes the DMG.
+#   make release VERSION=0.2.0   signed, notarized, published on GitHub
 
 SDK      := $(shell xcrun --sdk macosx --show-sdk-path)
 GO       ?= $(shell command -v go || echo /opt/homebrew/bin/go)
@@ -16,7 +15,7 @@ CONFIG   ?= Release
 LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 STAMP    := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) $(if $(BUILD),CURRENT_PROJECT_VERSION=$(BUILD))
 
-.PHONY: all core app run clean project dmg site
+.PHONY: all core app run clean project dmg site release
 
 all: app
 
@@ -53,6 +52,11 @@ run: app
 
 dmg: app
 	tools/make_dmg.sh $(APP)
+
+# Signed with Developer ID through Xcode's account, notarized, stapled, published on
+# GitHub (tools/release/release.sh). PUBLISH=0 stops before publishing.
+release:
+	VERSION="$(VERSION)" PUBLISH="$(PUBLISH)" tools/release/release.sh
 
 # The static site in site/ links the DMG next to index.html.
 site: dmg

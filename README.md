@@ -20,25 +20,13 @@ Coming from a build named WA: the first launch quits if WA is still running, the
 
 ## Releasing
 
-Push a version tag and GitHub Actions builds the DMG and publishes it as a release (`.github/workflows/release.yml`, on a `macos-26` runner with Xcode 26.3):
-
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+make release VERSION=0.2.0
 ```
 
-The tag sets the version (`CFBundleShortVersionString` 0.2.0) and the run number sets the build. Running the workflow by hand (Actions › Release › Run workflow) makes a test build that's kept as an artifact for a week and publishes nothing. Locally, `VERSION=0.2.0 BUILD=12 make dmg` stamps the same way.
+That archives the app, signs it with Developer ID through Xcode's account (the Apple ID signed in under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud, so there's no certificate file, password or secret), sends it to Apple's notary service through the same account, staples the ticket, packs the branded DMG, checks it with Gatekeeper, and publishes `v0.2.0` on GitHub with the DMG and its SHA-256. The version comes from `VERSION`, the build number from the commit count. It releases only main as pushed with a clean tree; `PUBLISH=0 make release VERSION=0.2.0` does everything except publishing. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
 
-Signing and notarization switch on when these repository secrets exist (Settings › Secrets and variables › Actions). Without them the release is ad-hoc signed, and people approve it once in System Settings › Privacy & Security.
-
-| Secret | What it is |
-|---|---|
-| `MACOS_CERTIFICATE` | Your Developer ID Application certificate and key, exported as a .p12 and base64-encoded (`base64 -i cert.p12 \| pbcopy`) |
-| `MACOS_CERTIFICATE_PASSWORD` | The password you gave the .p12 |
-| `APPLE_ID` | The Apple ID email of your developer account |
-| `APPLE_TEAM_ID` | Your 10-character team ID |
-| `APPLE_APP_PASSWORD` | An app-specific password for that Apple ID (account.apple.com › Sign-In and Security) |
-
-`gh secret set MACOS_CERTIFICATE < cert.b64` and so on sets them from the terminal. Signed releases use the hardened runtime with the entitlements in `app/Backchannel.entitlements` (camera and microphone).
+Actions › Test build › Run workflow (`.github/workflows/release.yml`, a `macos-26` runner with Xcode 26.3) makes an ad-hoc signed test build on a clean machine and keeps it as an artifact for a week.
 
 ## Architecture
 

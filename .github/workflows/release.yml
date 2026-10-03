@@ -1,39 +1,31 @@
-# Builds Backchannel and publishes the DMG as a GitHub release.
+# A clean-machine test build of Backchannel, kept as an artifact for a week:
 #
-#   git tag v0.2.0 && git push origin v0.2.0   -> builds 0.2.0 and publishes the release
-#   Actions › Release › Run workflow           -> a test build, uploaded as an artifact only
+#   Actions › Test build › Run workflow
 #
-# With the Developer ID secrets set (see README › Releasing), the app is signed with the
-# hardened runtime and the DMG is notarized and stapled. Without them the build is
-# ad-hoc signed, and macOS asks people to approve it in System Settings the first time.
-name: Release
+# Releases don't come from here. `make release VERSION=0.2.0` signs with the Developer ID
+# that Xcode manages for the team, notarizes, staples and publishes on GitHub
+# (tools/release/release.sh); that needs the Apple ID signed in to Xcode, which a runner
+# doesn't have. This build is ad-hoc signed.
+name: Test build
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: Version to stamp on the test build (nothing is published)
+        description: Version to stamp on the test build
         default: 0.0.0
         required: true
 
 permissions:
-  contents: write
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: macos-26
     timeout-minutes: 45
     env:
       # The same Xcode the app is developed with; macOS 26 SDK and Icon Composer support.
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-      HAS_DEVELOPER_ID: ${{ secrets.MACOS_CERTIFICATE != '' }}
-      HAS_NOTARY: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -46,103 +38,22 @@ jobs:
         # webp: the app links Homebrew's static libwebp (app/project.yml OTHER_LDFLAGS).
         run: brew install xcodegen create-dmg webp
 
-      - name: Work out the version
-        id: version
-        run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            v="${GITHUB_REF_NAME#v}"
-          else
-            v="${{ inputs.version }}"
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "Building $v ($GITHUB_RUN_NUMBER)"
-
       - name: Build the app
-        run: make app VERSION="${{ steps.version.outputs.version }}" BUILD="$GITHUB_RUN_NUMBER"
-
-      - name: Sign with Developer ID
-        id: sign
-        if: env.HAS_DEVELOPER_ID == 'true'
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: |
-          keychain="$RUNNER_TEMP/release.keychain-db"
-          pass="$(openssl rand -hex 24)"
-          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p "$pass" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$pass" "$keychain"
-          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" > /dev/null
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          rm "$RUNNER_TEMP/cert.p12"
-          identity="$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')"
-          [ -n "$identity" ] || { echo "No Developer ID Application identity in the certificate"; exit 1; }
-          codesign --force --options runtime --timestamp \
-            --entitlements app/Backchannel.entitlements --sign "$identity" build/Backchannel.app
-          codesign --verify --strict --verbose=2 build/Backchannel.app
-          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+        run: make app VERSION="${{ inputs.version }}" BUILD="$GITHUB_RUN_NUMBER"
 
       - name: Make the disk image
         id: dmg
         run: |
           tools/make_dmg.sh build/Backchannel.app
-          dmg="build/Backchannel-${{ steps.version.outputs.version }}.dmg"
+          dmg="build/Backchannel-${{ inputs.version }}.dmg"
           [ -f "$dmg" ] || { echo "make_dmg.sh didn't produce $dmg"; ls build; exit 1; }
           echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          cd build && shasum -a 256 "$(basename "$dmg")" | tee "$(basename "$dmg").sha256"
 
-      - name: Sign and notarize the disk image
-        if: env.HAS_DEVELOPER_ID == 'true' && env.HAS_NOTARY == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          dmg="${{ steps.dmg.outputs.path }}"
-          codesign --force --timestamp --sign "${{ steps.sign.outputs.identity }}" "$dmg"
-          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
-          xcrun stapler staple "$dmg"
-          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
-
-      - name: Checksum
-        run: |
-          cd build
-          shasum -a 256 "$(basename "${{ steps.dmg.outputs.path }}")" | tee "$(basename "${{ steps.dmg.outputs.path }}").sha256"
-
-      - name: Publish the release
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          v="${{ steps.version.outputs.version }}"
-          dmg="${{ steps.dmg.outputs.path }}"
-          {
-            echo "Backchannel $v for macOS 26 Tahoe on Apple silicon."
-            echo
-            echo "Unofficial. Not affiliated with WhatsApp or Meta."
-            echo
-            if [ "$HAS_DEVELOPER_ID" = true ] && [ "$HAS_NOTARY" = true ]; then
-              echo "Signed with Developer ID and notarized by Apple."
-            else
-              echo "This build isn't notarized yet. After dragging it to Applications, open it once,"
-              echo "then go to System Settings › Privacy & Security and choose Open Anyway."
-            fi
-          } > "$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" "$dmg" "$dmg.sha256" \
-            --title "Backchannel $v" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes --verify-tag
-
-      - name: Keep the test build
-        if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
-          name: Backchannel-${{ steps.version.outputs.version }}
+          name: Backchannel-${{ inputs.version }}
           path: |
             ${{ steps.dmg.outputs.path }}
             ${{ steps.dmg.outputs.path }}.sha256
           retention-days: 7
-
-      - name: Clean up the keychain
-        if: always() && env.HAS_DEVELOPER_ID == 'true'
-        run: security delete-keychain "$RUNNER_TEMP/release.keychain-db" || true
