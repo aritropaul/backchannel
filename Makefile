@@ -5,7 +5,8 @@
 #   make core     just the Go c-archive
 #   VERSION=0.2.0 BUILD=12 make dmg   stamp a version
 #
-#   make release VERSION=0.2.0   signed, notarized, published on GitHub
+#   make release VERSION=0.3     tag v0.3 and push it; GitHub Actions signs, notarizes, publishes
+#   make release-local VERSION=0.3   the same on this Mac, through Xcode's account
 
 SDK      := $(shell xcrun --sdk macosx --show-sdk-path)
 GO       ?= $(shell command -v go || echo /opt/homebrew/bin/go)
@@ -18,7 +19,7 @@ LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 BUILD    ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 STAMP    := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) CURRENT_PROJECT_VERSION=$(BUILD)
 
-.PHONY: all core app run clean project dmg site release
+.PHONY: all core app run clean project dmg site release release-local
 
 all: app
 
@@ -59,9 +60,21 @@ run: app
 dmg: app
 	tools/make_dmg.sh $(APP)
 
-# Signed with Developer ID through Xcode's account, notarized, stapled, published on
-# GitHub (tools/release/release.sh). PUBLISH=0 stops before publishing.
+# Releases come from GitHub Actions (.github/workflows/release.yml, which runs
+# tools/release/release.sh): this tags main as pushed and pushes the tag.
 release:
+	@[ -n "$(VERSION)" ] || { echo "usage: make release VERSION=0.3"; exit 1; }
+	@[ -z "$$(git status --porcelain)" ] || { echo "Commit your changes first: a release is built from main as pushed."; exit 1; }
+	@git fetch -q origin main
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { echo "HEAD isn't origin/main. Push main first."; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null || { echo "v$(VERSION) is already tagged."; exit 1; }
+	git tag v$(VERSION)
+	git push origin v$(VERSION)
+	@echo "GitHub Actions is releasing v$(VERSION): https://github.com/aritropaul/backchannel/actions/workflows/release.yml"
+
+# The same release built and signed on this Mac, through Xcode's account.
+# PUBLISH=0 stops before publishing.
+release-local:
 	VERSION="$(VERSION)" PUBLISH="$(PUBLISH)" tools/release/release.sh
 
 # The static site in site/ links the DMG next to index.html.

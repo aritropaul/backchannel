@@ -1,33 +1,71 @@
-# A clean-machine test build of Backchannel, kept as an artifact for a week:
+# Releases Backchannel when a version tag is pushed:
 #
-#   Actions › Test build › Run workflow
+#   make release VERSION=0.3      (tags v0.3 on main as pushed, and pushes the tag)
 #
-# Releases don't come from here. `make release VERSION=0.2.0` signs with the Developer ID
-# that Xcode manages for the team, notarizes, staples and publishes on GitHub
-# (tools/release/release.sh); that needs the Apple ID signed in to Xcode, which a runner
-# doesn't have. This build is ad-hoc signed.
-name: Test build
+# tools/release/release.sh does the work: archive, sign with the team's Developer ID
+# certificate, notarize and staple, the branded disk image, the update signature (checked
+# against the key the app carries), then the GitHub release with the DMG, its SHA-256 and
+# appcast.xml, which installed copies read once a day. Actions › Release › Run workflow
+# re-runs a tag, repairing a release that went up half finished.
+#
+# Repository secrets, the same names as voom's:
+#   DEVELOPER_ID_CERT_BASE64    the Developer ID Application certificate and key, a .p12 in base64
+#   DEVELOPER_ID_CERT_PASSWORD  its password
+#   APPLE_ID                    the Apple ID that notarizes
+#   APPLE_ID_PASSWORD           an app-specific password for it (appleid.apple.com)
+#   SPARKLE_PRIVATE_KEY         this app's update key (generate_keys --account backchannel -x)
+#   APPLE_TEAM_ID               optional; 2J3WW2KWBU otherwise
+name: Release
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      version:
-        description: Version to stamp on the test build
-        default: 0.0.0
+      tag:
+        description: Existing tag to build and publish, e.g. v0.3
         required: true
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
 
 jobs:
-  build:
+  release:
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       # The same Xcode the app is developed with; macOS 26 SDK and Icon Composer support.
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      - name: Check the secrets
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          missing=""
+          [ -n "$P12" ] || missing="$missing DEVELOPER_ID_CERT_BASE64"
+          [ -n "$P12_PASSWORD" ] || missing="$missing DEVELOPER_ID_CERT_PASSWORD"
+          [ -n "$APPLE_ID" ] || missing="$missing APPLE_ID"
+          [ -n "$APPLE_ID_PASSWORD" ] || missing="$missing APPLE_ID_PASSWORD"
+          [ -n "$SPARKLE_PRIVATE_KEY" ] || missing="$missing SPARKLE_PRIVATE_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings › Secrets and variables › Actions)"
+            exit 1
+          fi
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::$TAG isn't a version tag like v0.3"; exit 1 ;; esac
+
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # The build number is the commit count, and the tag has to be on main.
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -36,24 +74,48 @@ jobs:
 
       - name: Install build tools
         # webp: the app links Homebrew's static libwebp (app/project.yml OTHER_LDFLAGS).
-        run: brew install xcodegen create-dmg webp
+        # openssl@3: checking the update signature (macOS's LibreSSL can't verify Ed25519).
+        run: brew install xcodegen create-dmg webp openssl@3
 
-      - name: Build the app
-        run: make app VERSION="${{ inputs.version }}" BUILD="$GITHUB_RUN_NUMBER"
-
-      - name: Make the disk image
-        id: dmg
+      - name: Import the Developer ID certificate
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
         run: |
-          tools/make_dmg.sh build/Backchannel.app
-          dmg="build/Backchannel-${{ inputs.version }}.dmg"
-          [ -f "$dmg" ] || { echo "make_dmg.sh didn't produce $dmg"; ls build; exit 1; }
-          echo "path=$dmg" >> "$GITHUB_OUTPUT"
-          cd build && shasum -a 256 "$(basename "$dmg")" | tee "$(basename "$dmg").sha256"
+          set -euo pipefail
+          # A throwaway keychain unlocked with a password only this job knows, deleted in
+          # the last step, so the key never outlives the run.
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          pw=$(uuidgen)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          # Developer ID certificates chain through the G2 intermediate, which a new
+          # keychain doesn't have.
+          curl -sSfL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$kc" -T /usr/bin/codesign
+          echo -n "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign waits on a GUI prompt that never comes.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          if ! security find-identity -v -p codesigning "$kc" | grep -q "Developer ID Application"; then
+            echo "::error::DEVELOPER_ID_CERT_BASE64 holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "KEYCHAIN=$kc" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: Backchannel-${{ inputs.version }}
-          path: |
-            ${{ steps.dmg.outputs.path }}
-            ${{ steps.dmg.outputs.path }}.sha256
-          retention-days: 7
+      - name: Build, sign, notarize and publish
+        env:
+          SIGNING: keychain
+          GH_TOKEN: ${{ github.token }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID || '2J3WW2KWBU' }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: VERSION="${TAG#v}" tools/release/release.sh
+
+      - name: Delete the keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true

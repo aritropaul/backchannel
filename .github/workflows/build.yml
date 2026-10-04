@@ -1,0 +1,57 @@
+# A clean-machine test build of Backchannel, kept as an artifact for a week:
+#
+#   Actions › Test build › Run workflow
+#
+# It's ad-hoc signed, for checking that the app builds. Releases come from release.yml,
+# when a version tag is pushed (make release VERSION=0.3).
+name: Test build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp on the test build
+        default: 0.0.0
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      # The same Xcode the app is developed with; macOS 26 SDK and Icon Composer support.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+
+      - name: Install build tools
+        # webp: the app links Homebrew's static libwebp (app/project.yml OTHER_LDFLAGS).
+        run: brew install xcodegen create-dmg webp
+
+      - name: Build the app
+        run: make app VERSION="${{ inputs.version }}" BUILD="$GITHUB_RUN_NUMBER"
+
+      - name: Make the disk image
+        id: dmg
+        run: |
+          tools/make_dmg.sh build/Backchannel.app
+          dmg="build/Backchannel-${{ inputs.version }}.dmg"
+          [ -f "$dmg" ] || { echo "make_dmg.sh didn't produce $dmg"; ls build; exit 1; }
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          cd build && shasum -a 256 "$(basename "$dmg")" | tee "$(basename "$dmg").sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Backchannel-${{ inputs.version }}
+          path: |
+            ${{ steps.dmg.outputs.path }}
+            ${{ steps.dmg.outputs.path }}.sha256
+          retention-days: 7
