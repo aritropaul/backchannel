@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if core.isPaired && !qrPreview { main.showMain() } else { main.showPairing() }
         main.showWindow(nil)
         updateBadge()
+        Updates.start()
         // Dev affordances: WA_SLOWMO=<n> slows every animation n×; WA_PREVIEW_DEMO plays a scripted chat.
         let env = ProcessInfo.processInfo.environment
         if let slow = env["WA_SLOWMO"].flatMap(Float.init), slow > 1, let root = main.window?.contentView?.superview {
@@ -571,6 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         _ = menu(Brand.name, [
             item("About \(Brand.name)", #selector(showAbout(_:)), target: self),
+            Updates.menuItem(),
             .separator(),
             item("Settings…", #selector(showSettings(_:)), ",", target: self),
             .separator(),

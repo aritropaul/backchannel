@@ -106,6 +106,7 @@ final class AboutWindowController: NSWindowController {
         ("libsignal (go.mau.fi)", "The Signal protocol in Go.", "GNU General Public License v3.0"),
         ("go.mau.fi/util", "Tulir Asokan.", "Mozilla Public License 2.0"),
         ("libwebp", "Google. Sticker encoding.", "BSD 3-Clause License"),
+        ("Sparkle", "Andy Matuschak and the Sparkle Project. Updates.", "MIT License"),
         ("Instrument Sans", "The Instrument Sans Project Authors. The wordmark.", "SIL Open Font License 1.1"),
         ("go-sqlite3", "Yasuhiro Matsumoto.", "MIT License"),
         ("protobuf-go", "The Go Authors.", "BSD 3-Clause License"),

@@ -40,5 +40,11 @@
 	<true/>
 	<key>NSSupportsAutomaticTermination</key>
 	<false/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/aritropaul/backchannel/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>EsmceJcgOOekqtjZEeR/B8lvuwK8qZoiBLLyGMlkcKE=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 </dict>
 </plist>

@@ -13,7 +13,10 @@ CORE_SRC := $(wildcard core/*.go) core/go.mod core/go.sum Makefile
 APP      := build/Backchannel.app
 CONFIG   ?= Release
 LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-STAMP    := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) $(if $(BUILD),CURRENT_PROJECT_VERSION=$(BUILD))
+# The build number is the commit count, as in releases, so Sparkle never offers a build
+# older than the one running.
+BUILD    ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
+STAMP    := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) CURRENT_PROJECT_VERSION=$(BUILD)
 
 .PHONY: all core app run clean project dmg site release
 
@@ -44,6 +47,9 @@ app: core app/Backchannel.xcodeproj
 	@rm -rf $(APP) && mv build/dd/Build/Products/$(CONFIG)/Backchannel.app $(APP)
 	@# xcodebuild registers its product with LaunchServices; point that at the moved copy.
 	@$(LSREG) -u $(CURDIR)/build/dd/Build/Products/$(CONFIG)/Backchannel.app 2>/dev/null || true
+	@# So are Sparkle's Updater.app copies in derived data; the app keeps its own.
+	@$(LSREG) -u $(CURDIR)/build/dd/Build/Products/$(CONFIG)/Backchannel.app/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app 2>/dev/null || true
+	@find $(CURDIR)/build/dd -name Updater.app -prune -exec $(LSREG) -u {} \; 2>/dev/null || true
 	@$(LSREG) -f $(CURDIR)/$(APP)
 	@echo "built $(APP)"
 

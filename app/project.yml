@@ -4,6 +4,11 @@ options:
   deploymentTarget:
     macOS: "26.0"
   createIntermediateGroups: true
+packages:
+  # Updates (Updates.swift); the tools that sign them come with it (tools/release/release.sh).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -15,13 +20,16 @@ settings:
     DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     DEAD_CODE_STRIPPING: YES
-    # Releases override these from the tag (make app VERSION=… BUILD=…).
+    # Releases set the version from the tag; every build takes the commit count as its
+    # build number (make app VERSION=… BUILD=…), which is what Sparkle compares.
     MARKETING_VERSION: "0.1"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   Backchannel:
     type: application
     platform: macOS
+    dependencies:
+      - package: Sparkle
     sources:
       - path: Sources
       # Icon Composer document: one file reference, compiled by actool (XcodeGen #1556).
