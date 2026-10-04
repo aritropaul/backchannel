@@ -83,13 +83,13 @@ Coming from a build named WA: the first launch quits if WA is still running, the
 make release VERSION=0.3
 ```
 
-That tags main as pushed (`v0.3`) and pushes the tag, and GitHub Actions does the rest (`.github/workflows/release.yml`, running `tools/release/release.sh` on a `macos-26` runner with Xcode 26.3). It archives the app, signs it with the team's Developer ID certificate, sends it to Apple's notary service, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and checks that signature against the key the app carries, then publishes the release with the DMG, its SHA-256 and `appcast.xml`. The version comes from the tag, the build number from the commit count. Actions › Release › Run workflow re-runs a tag. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
+That tags main as pushed (`v0.3`) and pushes the tag, and GitHub Actions does the rest (`.github/workflows/release.yml`, running `tools/release/release.sh` on a `macos-26` runner with Xcode 26.3). It archives the app, signs it with the team's Developer ID certificate, notarizes it with an App Store Connect API key, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and checks that signature against the key the app carries, then publishes the release with the DMG, its SHA-256 and `appcast.xml`. The version comes from the tag, the build number from the commit count. Actions › Release › Run workflow builds a version from a branch; with "publish" off it's a dry run that keeps the DMG as an artifact. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
 
 The workflow reads these repository secrets (Settings › Secrets and variables › Actions), and its first step names any that are missing:
 
-- `DEVELOPER_ID_CERT_BASE64`: the Developer ID Application certificate with its private key, exported as a .p12 and base64-encoded
+- `DEVELOPER_ID_CERT_BASE64`: a Developer ID Application certificate with its private key, as a base64 .p12. CI can't use the cloud-managed Developer ID that Xcode signs with here: Apple refuses it to API keys ("Cloud signing permission error").
 - `DEVELOPER_ID_CERT_PASSWORD`: that .p12's password
-- `APPLE_ID` and `APPLE_ID_PASSWORD`: the Apple ID that notarizes, with an app-specific password from appleid.apple.com
+- `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8`: the App Store Connect API key that notarizes ("Backchannel CI", a team key)
 - `SPARKLE_PRIVATE_KEY`: the update key (below)
 
 `make release-local VERSION=0.3` runs the same pipeline on this Mac instead, signing and notarizing through Xcode's account (the Apple ID under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud) and reading the update key from the login keychain. `PUBLISH=0 make release-local VERSION=0.3` stops before publishing.

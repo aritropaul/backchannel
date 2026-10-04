@@ -10,8 +10,10 @@
 #
 # Signing depends on where it runs:
 # - SIGNING=keychain (CI): the Developer ID certificate the workflow imported into a
-#   throwaway keychain ($KEYCHAIN), then notarytool with an Apple ID and app-specific
-#   password (NOTARY_APPLE_ID, NOTARY_PASSWORD). The update key is SPARKLE_PRIVATE_KEY.
+#   throwaway keychain ($KEYCHAIN), then notarytool with an App Store Connect API key
+#   (NOTARY_KEY, the .p8 file, with NOTARY_KEY_ID and NOTARY_ISSUER). Apple doesn't let an
+#   API key use the cloud-managed Developer ID, hence the certificate. The update key is
+#   SPARKLE_PRIVATE_KEY.
 # - SIGNING=xcode (here, the default): the Developer ID that Xcode manages in the cloud for
 #   the team (the Apple ID under Xcode › Settings › Accounts), notarized through the same
 #   account. The update key is in the login keychain (Sparkle's generate_keys, account
@@ -41,8 +43,8 @@ export GH_TOKEN
 case "$SIGNING" in
   xcode) ;;
   keychain)
-    [ -n "${NOTARY_APPLE_ID:-}" ] && [ -n "${NOTARY_PASSWORD:-}" ] || {
-      echo "SIGNING=keychain needs NOTARY_APPLE_ID and NOTARY_PASSWORD (an app-specific password)."; exit 1; }
+    [ -f "${NOTARY_KEY:-}" ] && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER:-}" ] || {
+      echo "SIGNING=keychain needs NOTARY_KEY (an App Store Connect .p8), NOTARY_KEY_ID and NOTARY_ISSUER."; exit 1; }
     security find-identity -v -p codesigning ${KEYCHAIN:+"$KEYCHAIN"} | grep -q "$IDENTITY" || {
       echo "No \"$IDENTITY\" signing identity in the keychain."; exit 1; } ;;
   *) echo "SIGNING is xcode or keychain, not $SIGNING."; exit 1 ;;
@@ -136,14 +138,14 @@ else
   echo "Sending to Apple's notary service…"
   ditto -c -k --keepParent "$APP" "$OUT/notarize.zip"
   set +e
-  RESULT="$(xcrun notarytool submit "$OUT/notarize.zip" --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" \
-    --team-id "$TEAM" --wait --timeout 30m 2>&1)"
+  NOTARY="--key $NOTARY_KEY --key-id $NOTARY_KEY_ID --issuer $NOTARY_ISSUER"
+  RESULT="$(xcrun notarytool submit "$OUT/notarize.zip" $NOTARY --wait --timeout 30m 2>&1)"
   STATUS=$?
   set -e
   echo "$RESULT"
   if ! echo "$RESULT" | grep -q "status: Accepted"; then
     ID="$(echo "$RESULT" | awk '$1 == "id:" { print $2; exit }')"
-    [ -z "$ID" ] || xcrun notarytool log "$ID" --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$TEAM" || true
+    [ -z "$ID" ] || xcrun notarytool log "$ID" $NOTARY || true
     echo "Not notarized (notarytool exited $STATUS)."
     exit 1
   fi

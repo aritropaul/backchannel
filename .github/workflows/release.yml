@@ -5,14 +5,17 @@
 # tools/release/release.sh does the work: archive, sign with the team's Developer ID
 # certificate, notarize and staple, the branded disk image, the update signature (checked
 # against the key the app carries), then the GitHub release with the DMG, its SHA-256 and
-# appcast.xml, which installed copies read once a day. Actions › Release › Run workflow
-# re-runs a tag, repairing a release that went up half finished.
+# appcast.xml, which installed copies read once a day.
 #
-# Repository secrets, the same names as voom's:
+# Actions › Release › Run workflow builds a version from the branch you pick. With
+# "publish" off it stops before the GitHub release (a dry run of the whole pipeline); with
+# it on it releases, or repairs a release that went up half finished.
+#
+# Repository secrets:
 #   DEVELOPER_ID_CERT_BASE64    the Developer ID Application certificate and key, a .p12 in base64
 #   DEVELOPER_ID_CERT_PASSWORD  its password
-#   APPLE_ID                    the Apple ID that notarizes
-#   APPLE_ID_PASSWORD           an app-specific password for it (appleid.apple.com)
+#   ASC_KEY_ID, ASC_ISSUER_ID   the App Store Connect API key that notarizes
+#   ASC_KEY_P8                  that key's .p8 file
 #   SPARKLE_PRIVATE_KEY         this app's update key (generate_keys --account backchannel -x)
 #   APPLE_TEAM_ID               optional; 2J3WW2KWBU otherwise
 name: Release
@@ -22,15 +25,19 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing tag to build and publish, e.g. v0.3
+      version:
+        description: Version to build, e.g. 0.3
         required: true
+      publish:
+        description: Publish the GitHub release (off = dry run)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.version || github.ref_name }}
 
 jobs:
   release:
@@ -39,32 +46,34 @@ jobs:
     env:
       # The same Xcode the app is developed with; macOS 26 SDK and Icon Composer support.
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-      TAG: ${{ inputs.tag || github.ref_name }}
+      TAG: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+      PUBLISH: ${{ (github.event_name == 'push' || inputs.publish) && '1' || '0' }}
     steps:
       - name: Check the secrets
         env:
           P12: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
           P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           missing=""
           [ -n "$P12" ] || missing="$missing DEVELOPER_ID_CERT_BASE64"
           [ -n "$P12_PASSWORD" ] || missing="$missing DEVELOPER_ID_CERT_PASSWORD"
-          [ -n "$APPLE_ID" ] || missing="$missing APPLE_ID"
-          [ -n "$APPLE_ID_PASSWORD" ] || missing="$missing APPLE_ID_PASSWORD"
+          [ -n "$ASC_KEY_ID" ] || missing="$missing ASC_KEY_ID"
+          [ -n "$ASC_ISSUER_ID" ] || missing="$missing ASC_ISSUER_ID"
+          [ -n "$ASC_KEY_P8" ] || missing="$missing ASC_KEY_P8"
           [ -n "$SPARKLE_PRIVATE_KEY" ] || missing="$missing SPARKLE_PRIVATE_KEY"
           if [ -n "$missing" ]; then
             echo "::error::Missing repository secrets:$missing (Settings › Secrets and variables › Actions)"
             exit 1
           fi
-          case "$TAG" in v[0-9]*) ;; *) echo "::error::$TAG isn't a version tag like v0.3"; exit 1 ;; esac
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::$TAG isn't a version like v0.3"; exit 1 ;; esac
 
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
-          # The build number is the commit count, and the tag has to be on main.
+          # The build number is the commit count, and a release has to come from main.
           fetch-depth: 0
 
       - uses: actions/setup-go@v7
@@ -77,14 +86,15 @@ jobs:
         # openssl@3: checking the update signature (macOS's LibreSSL can't verify Ed25519).
         run: brew install xcodegen create-dmg webp openssl@3
 
-      - name: Import the Developer ID certificate
+      - name: Import the Developer ID certificate and the API key
         env:
           P12: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
           P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
           set -euo pipefail
           # A throwaway keychain unlocked with a password only this job knows, deleted in
-          # the last step, so the key never outlives the run.
+          # the last step with the key file, so neither outlives the run.
           kc="$RUNNER_TEMP/signing.keychain-db"
           pw=$(uuidgen)
           security create-keychain -p "$pw" "$kc"
@@ -105,17 +115,31 @@ jobs:
             exit 1
           fi
           echo "KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          (umask 077; printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/notary.p8")
 
       - name: Build, sign, notarize and publish
         env:
           SIGNING: keychain
           GH_TOKEN: ${{ github.token }}
-          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
-          NOTARY_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          NOTARY_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.ASC_ISSUER_ID }}
           TEAM: ${{ secrets.APPLE_TEAM_ID || '2J3WW2KWBU' }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: VERSION="${TAG#v}" tools/release/release.sh
+        run: NOTARY_KEY="$RUNNER_TEMP/notary.p8" VERSION="${TAG#v}" tools/release/release.sh
 
-      - name: Delete the keychain
+      - uses: actions/upload-artifact@v7
+        # A dry run keeps what it built, to look at.
+        if: env.PUBLISH != '1'
+        with:
+          name: Backchannel-${{ env.TAG }}-dry-run
+          path: |
+            build/Backchannel-*.dmg
+            build/Backchannel-*.dmg.sha256
+            build/appcast.xml
+          retention-days: 7
+
+      - name: Delete the keychain and the key file
         if: always()
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8"
