@@ -2,7 +2,7 @@
 
 A native Mac app for WhatsApp.
 
-It opens in under half a second with your chats already on screen, uses under 0.2% CPU while it waits, and the whole app is 22 MB. WhatsApp's own Mac app is 657 MB.
+It opens in under half a second with your chats already on screen, uses under 0.2% CPU while it waits, and the whole app is 21 MB. WhatsApp's own Mac app is 657 MB.
 
 > Unofficial. Not affiliated with WhatsApp or Meta. WhatsApp can ban accounts it sees using unofficial clients. Backchannel links to your phone the way WhatsApp Web does, over the official multi-device companion protocol (through [whatsmeow](https://github.com/tulir/whatsmeow)). That keeps the risk low, but it isn't zero.
 
@@ -16,7 +16,7 @@ It opens in under half a second with your chats already on screen, uses under 0.
 
 On first launch, scan the code with your phone (Settings › Linked Devices › Link a Device), or link with your phone number instead. Your phone stays the main device, as it does with WhatsApp Web.
 
-There's no automatic update yet; new versions appear on the Releases page.
+Versions after 0.2 update themselves. Once a day Backchannel checks for a new release and offers to install it, and Backchannel › Check for Updates… checks straight away. 0.2 and earlier can't, so download the next version by hand once.
 
 ## Fast and light
 
@@ -24,7 +24,7 @@ Measured on a 16 GB M5 MacBook, next to WhatsApp for Mac 26.37.76:
 
 | | Backchannel | WhatsApp for Mac |
 |---|---|---|
-| App size | 22 MB (an 8.3 MB download) | 657 MB |
+| App size | 21 MB (a 9.2 MB download) | 657 MB |
 | Memory, idle | 91 MB | 262 MB (195 MB for the app, plus 37 MB and 30 MB for two extensions) |
 | CPU, idle | 0.03–0.17% | 0.75–8.3% |
 | Launch to a usable window | 0.3–0.5 s, with chats, photos and the last conversation drawn | 1.0–1.6 s warm and 2.5 s cold, with placeholder photos |
@@ -60,7 +60,6 @@ It looks and moves like Messages: a glass sidebar, pinned chats as large avatars
 - Usernames, two-step verification and reporting, which whatsmeow doesn't support.
 - Syncing a few things that only live on this Mac: chat themes, locked chats, and stickers you favourite here.
 - Intel Macs and macOS before 26.
-- Updating itself. Download new versions from Releases.
 
 And it's unofficial; see the note at the top.
 
@@ -84,7 +83,9 @@ Coming from a build named WA: the first launch quits if WA is still running, the
 make release VERSION=0.2.0
 ```
 
-That archives the app, signs it with Developer ID through Xcode's account (the Apple ID signed in under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud, so there's no certificate file, password or secret), sends it to Apple's notary service through the same account, staples the ticket, packs the branded DMG, checks it with Gatekeeper, and publishes `v0.2.0` on GitHub with the DMG and its SHA-256. The version comes from `VERSION`, the build number from the commit count. It releases only main as pushed with a clean tree; `PUBLISH=0 make release VERSION=0.2.0` does everything except publishing. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
+That archives the app, signs it with Developer ID through Xcode's account (the Apple ID signed in under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud, so there's no certificate file, password or secret), sends it to Apple's notary service through the same account, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and writes `appcast.xml`, and publishes `v0.2.0` on GitHub with the DMG, its SHA-256 and the appcast. The version comes from `VERSION`, the build number from the commit count. It releases only main as pushed with a clean tree; `PUBLISH=0 make release VERSION=0.2.0` does everything except publishing. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
+
+Installed copies update through [Sparkle](https://sparkle-project.org). Once a day they read `appcast.xml` from the latest release, and they install a download only if its EdDSA signature matches the public key in `app/Sources/Info.plist` (`SUPublicEDKey`). The private key is in the login keychain, made once with Sparkle's `generate_keys --account backchannel`, and the first release asks whether `sign_update` may use it. Keep a copy somewhere safe (`generate_keys --account backchannel -x <file>`): without it, installed copies can't be updated.
 
 Actions › Test build › Run workflow (`.github/workflows/release.yml`, a `macos-26` runner with Xcode 26.3) makes an ad-hoc signed test build on a clean machine and keeps it as an artifact for a week.
 
@@ -110,3 +111,7 @@ python3 tools/make_preview_db.py build/preview
 WA_PREVIEW_DIR=$PWD/build/preview build/Backchannel.app/Contents/MacOS/Backchannel          # synthetic chats, no network
 WA_PREVIEW_DEMO=1 WA_SLOWMO=6 WA_PREVIEW_DIR=...                           # scripted send/typing/reply/tapback, 6× slow motion
 ```
+
+## Licence
+
+GPL-3.0; see [LICENSE](LICENSE). Backchannel links [libsignal for Go](https://github.com/tulir/libsignal-protocol-go), which is GPL-3.0, so the app as a whole is under the same licence. Everything else it's built on is listed with its licence in About Backchannel › Acknowledgements.
