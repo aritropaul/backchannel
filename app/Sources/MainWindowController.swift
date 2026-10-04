@@ -57,10 +57,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         split.addSplitViewItem(content)
         split.addSplitViewItem(profileItem)
         split.splitView.autosaveName = "WA.MainSplit"
-        split.onResize = { [weak self] in
-            self?.logLayout("split resized")
-            self?.noteSidebarResize()
-        }
+        split.onResize = { [weak self] in self?.noteSidebarResize() }
 
         list.delegate = self
         convo.onHeader = { [weak self] title, sub in
@@ -423,35 +420,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
         }
     }
 
-    // MARK: layout log (temporary, to catch the sidebar widening; see HANDOFF)
-
-    private var lastLayoutLine = ""
-
-    /// Appends the window and sidebar widths to layout.log in the data folder whenever
-    /// either changes, with what caused it and a short call stack.
-    func logLayout(_ cause: String) {
-        guard let w = window, isShowingMain else { return }
-        let state = "window=\(Int(w.frame.width))x\(Int(w.frame.height)) sidebar=\(Int(sidebarPosition)) "
-            + "compact=\(list.compact) live=\(w.inLiveResize) profile=\(profileItem.isCollapsed ? "closed" : "open")"
-        guard state != lastLayoutLine else { return }
-        lastLayoutLine = state
-        let stack = Thread.callStackSymbols.dropFirst(2).prefix(6).map { line -> String in
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            return parts.count > 3 ? String(parts[3]) : line
-        }.joined(separator: " < ")
-        let url = AppPaths.dataDir.appendingPathComponent("layout.log")
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(cause): \(state)\n    \(stack)\n"
-        if let h = try? FileHandle(forWritingTo: url) {
-            defer { try? h.close() }
-            if (try? h.seekToEnd()) ?? 0 > 400_000 { try? h.truncate(atOffset: 0) }
-            try? h.write(contentsOf: Data(line.utf8))
-        } else {
-            try? Data(line.utf8).write(to: url)
-        }
-    }
-
     func windowDidResize(_ notification: Notification) {
-        logLayout("window resized")
         noteWindowResize()
     }
 
