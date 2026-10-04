@@ -90,3 +90,54 @@ enum DevMoments {
         }
     }
 }
+
+extension ConversationViewController {
+    // MARK: dev (WA_MOMENTS): the moments played on screen; nothing reaches the core.
+
+    private func cell(for id: String) -> BubbleView? {
+        guard let row = rowIndex(of: id) else { return nil }
+        return tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView
+    }
+
+    /// A reaction flying in from where the menu's strip would be (below and right of the
+    /// message, as a right-click opens it).
+    func debugFlight(id: String, emoji: String) {
+        guard let cell = cell(for: id), let window = view.window, let b = cell.item?.tapbackBlock else { return }
+        let block = window.convertToScreen(cell.convert(b, to: nil))
+        flyReaction(id, emoji, from: NSRect(x: block.midX + 40, y: block.minY - 80, width: 38, height: 38),
+                    size: ReactionStripView.glyphSize)
+    }
+
+    /// The heartbeat on any message, to check its motion where no lone heart is on screen.
+    func debugBeat(id: String) {
+        guard let cell = cell(for: id), let b = cell.item?.tapbackBlock else { return }
+        Motion.heartbeat(cell.layer, about: CGPoint(x: b.midX, y: b.midY), delay: 0)
+    }
+
+    func debugEntrance(id: String) {
+        guard let cell = cell(for: id), let m = cell.item?.msg else { return }
+        animateEntrance(cell, sent: m.fromMe)
+    }
+
+    /// A two-finger swipe across the message, then the reply it sets up is cancelled.
+    func debugSwipe(id: String) {
+        guard let cell = cell(for: id), let window = view.window, let b = cell.item?.tapbackBlock else { return }
+        let r = window.convertToScreen(cell.convert(b, to: nil))
+        var steps: [DevMoments.Step] = [(.mayBegin, 0, 0), (.began, 2, 0.2)]
+        steps += Array(repeating: (.changed, 3.2, 0.1), count: 30)
+        steps += Array(repeating: (.changed, 0, 0), count: 12)
+        steps.append((.ended, 0, 0))
+        DevMoments.play(steps, at: CGPoint(x: r.midX, y: r.midY), into: { cell.scrollWheel(with: $0) }) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6 * Motion.slow) { self?.composerCancelReply() }
+        }
+    }
+
+    /// Dev hook: plays the newest downloaded video in the open chat.
+    func playLatestVideo() {
+        guard let c = chat, let id = store.latestID(chat: c.jid, kind: .video), let m = store.message(chat: c.jid, id: id) else {
+            NSLog("WA video: none in chat"); return
+        }
+        jump(to: id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.open(media: m) }
+    }
+}
