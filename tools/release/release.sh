@@ -121,7 +121,7 @@ else
   # downloader keeps its entitlements), Autoupdate, Updater.app, the framework, then the
   # app with its own entitlements. Hardened runtime and a secure timestamp throughout,
   # which notarization requires.
-  echo "Signing with $IDENTITY…"
+  echo "Signing with ${IDENTITY}…"
   mkdir -p "$OUT/signed"
   ditto "$ARCHIVED" "$OUT/signed/Backchannel.app"
   APP="$OUT/signed/Backchannel.app"
