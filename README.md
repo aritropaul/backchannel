@@ -80,14 +80,23 @@ Coming from a build named WA: the first launch quits if WA is still running, the
 ## Releasing
 
 ```sh
-make release VERSION=0.2.0
+make release VERSION=0.3
 ```
 
-That archives the app, signs it with Developer ID through Xcode's account (the Apple ID signed in under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud, so there's no certificate file, password or secret), sends it to Apple's notary service through the same account, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and writes `appcast.xml`, and publishes `v0.2.0` on GitHub with the DMG, its SHA-256 and the appcast. The version comes from `VERSION`, the build number from the commit count. It releases only main as pushed with a clean tree; `PUBLISH=0 make release VERSION=0.2.0` does everything except publishing. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
+That tags main as pushed (`v0.3`) and pushes the tag, and GitHub Actions does the rest (`.github/workflows/release.yml`, running `tools/release/release.sh` on a `macos-26` runner with Xcode 26.3). It archives the app, signs it with the team's Developer ID certificate, sends it to Apple's notary service, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and checks that signature against the key the app carries, then publishes the release with the DMG, its SHA-256 and `appcast.xml`. The version comes from the tag, the build number from the commit count. Actions › Release › Run workflow re-runs a tag. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
 
-Installed copies update through [Sparkle](https://sparkle-project.org). Once a day they read `appcast.xml` from the latest release, and they install a download only if its EdDSA signature matches the public key in `app/Sources/Info.plist` (`SUPublicEDKey`). The private key is in the login keychain, made once with Sparkle's `generate_keys --account backchannel`, and the first release asks whether `sign_update` may use it. Keep a copy somewhere safe (`generate_keys --account backchannel -x <file>`): without it, installed copies can't be updated.
+The workflow reads these repository secrets (Settings › Secrets and variables › Actions), and its first step names any that are missing:
 
-Actions › Test build › Run workflow (`.github/workflows/release.yml`, a `macos-26` runner with Xcode 26.3) makes an ad-hoc signed test build on a clean machine and keeps it as an artifact for a week.
+- `DEVELOPER_ID_CERT_BASE64`: the Developer ID Application certificate with its private key, exported as a .p12 and base64-encoded
+- `DEVELOPER_ID_CERT_PASSWORD`: that .p12's password
+- `APPLE_ID` and `APPLE_ID_PASSWORD`: the Apple ID that notarizes, with an app-specific password from appleid.apple.com
+- `SPARKLE_PRIVATE_KEY`: the update key (below)
+
+`make release-local VERSION=0.3` runs the same pipeline on this Mac instead, signing and notarizing through Xcode's account (the Apple ID under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud) and reading the update key from the login keychain. `PUBLISH=0 make release-local VERSION=0.3` stops before publishing.
+
+Installed copies update through [Sparkle](https://sparkle-project.org). Once a day they read `appcast.xml` from the latest release, and they install a download only if its EdDSA signature matches the public key in `app/Sources/Info.plist` (`SUPublicEDKey`). The private key was made with Sparkle's `generate_keys --account backchannel` and lives in the login keychain on the Mac that made it; CI gets it as `SPARKLE_PRIVATE_KEY` (`generate_keys --account backchannel -x <file>` exports it). Keep a copy somewhere safe: without it, installed copies can't be updated.
+
+Actions › Test build › Run workflow (`.github/workflows/build.yml`) makes an ad-hoc signed test build on a clean machine and keeps it as an artifact for a week.
 
 ## Architecture
 
