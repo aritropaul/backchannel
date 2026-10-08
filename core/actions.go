@@ -132,6 +132,8 @@ func call(raw []byte) (out any) {
 		err = a.edit(r.Chat, r.ID, r.Text)
 	case "revoke":
 		err = a.revoke(r.Chat, r.ID)
+	case "delete_for_me":
+		err = a.deleteForMe(r.Chat, r.ID)
 	case "retry":
 		err = a.retry(r.Chat, r.ID)
 	case "mark_read":

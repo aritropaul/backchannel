@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -336,6 +337,75 @@ func (a *App) onDeleteChat(e *events.DeleteChat) {
 		a.db.Exec(`DELETE FROM chats WHERE jid=?`, chat)
 	}
 	a.touchReload(chat)
+}
+
+// deleteForMe removes one message here and, through app state, on the phone and
+// other linked devices. Everyone else in the chat keeps it.
+func (a *App) deleteForMe(chatS, id string) error {
+	if err := a.ready(); err != nil {
+		return err
+	}
+	chat, err := parseChat(chatS)
+	if err != nil {
+		return err
+	}
+	var sender string
+	var fromMe int
+	var ts int64
+	if err := a.rdb.QueryRow(`SELECT sender, from_me, ts FROM messages WHERE chat=? AND id=?`, chatS, id).Scan(&sender, &fromMe, &ts); err != nil {
+		return err
+	}
+	// The same key as a star: the sender is named only for someone else's message in a group.
+	isFromMe, senderJID := "0", "0"
+	if fromMe == 1 {
+		isFromMe = "1"
+	} else if chat.Server == types.GroupServer && sender != "" {
+		senderJID = sender
+	}
+	patch := appstate.PatchInfo{Type: appstate.WAPatchRegularHigh, Mutations: []appstate.MutationInfo{{
+		Index:   []string{appstate.IndexDeleteMessageForMe, chat.String(), id, isFromMe, senderJID},
+		Version: 3,
+		Value: &waSyncAction.SyncActionValue{DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{
+			// The phone's saved copy of the media (its gallery) stays; only the message goes.
+			DeleteMedia:      proto.Bool(false),
+			MessageTimestamp: proto.Int64(ts / 1000),
+		}},
+	}}}
+	if err := a.cli.SendAppState(a.ctx, patch); err != nil {
+		return err
+	}
+	a.deleteLocal(chatS, id)
+	return nil
+}
+
+// onDeleteForMe applies a message deleted for me on the phone or another device.
+func (a *App) onDeleteForMe(e *events.DeleteForMe) {
+	a.deleteLocal(a.canon(e.ChatJID).String(), e.MessageID)
+}
+
+// deleteLocal removes a message, its reactions, receipts and votes, and this Mac's
+// copy of its media. A chat whose last message it was shows the one before.
+func (a *App) deleteLocal(chat, id string) {
+	var path string
+	if a.rdb.QueryRow(`SELECT media_path FROM messages WHERE chat=? AND id=?`, chat, id).Scan(&path) != nil {
+		return
+	}
+	a.db.Exec(`DELETE FROM messages WHERE chat=? AND id=?`, chat, id)
+	for _, t := range []string{"reactions", "receipts", "votes"} {
+		a.db.Exec(`DELETE FROM `+t+` WHERE chat=? AND msg_id=?`, chat, id)
+	}
+	// Only files the app keeps for itself; never something outside its media folder.
+	if path != "" && filepath.Dir(path) == filepath.Join(a.dir, "media") {
+		os.Remove(path)
+	}
+	var last string
+	a.db.QueryRow(`SELECT last_id FROM chats WHERE jid=?`, chat).Scan(&last)
+	if last == id {
+		var prev string
+		a.db.QueryRow(`SELECT id FROM messages WHERE chat=? ORDER BY ts DESC LIMIT 1`, chat).Scan(&prev)
+		a.db.Exec(`UPDATE chats SET last_id=? WHERE jid=?`, prev, chat)
+	}
+	a.touchMsg(chat, id)
 }
 
 // clearMedia deletes this Mac's downloaded copies of a chat's media; the

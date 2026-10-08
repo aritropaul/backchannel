@@ -1,7 +1,7 @@
 import AppKit
 
 /// What can be done to a message: reply, jump, open its media, the message menu with
-/// the tapback bar, reactions (and their flight), edit and delete for everyone.
+/// the tapback bar, reactions (and their flight), edit and delete.
 extension ConversationViewController {
     // MARK: message actions
 
@@ -191,9 +191,7 @@ extension ConversationViewController {
         }
         endGroup()
 
-        if m.fromMe && live && Date().timeIntervalSince(m.date) < 2 * 24 * 3600 {
-            item("Delete for Everyone…", "trash") { [weak self] in self?.confirmRevoke(m) }
-        }
+        item("Delete…", "trash") { [weak self] in self?.confirmDelete(m) }
         endGroup()
         return menu
     }
@@ -250,18 +248,30 @@ extension ConversationViewController {
         composer.focus()
     }
 
-    private func confirmRevoke(_ m: Message) {
-        guard let window = view.window else { return }
+    /// WhatsApp's limit for deleting your own message for everyone: 2 days and 12 hours.
+    static let revokeWindow: TimeInterval = 60 * 3600
+
+    /// WhatsApp's choices: your own message, while it's young enough, can go for everyone;
+    /// any message can go for you alone, here and on your phone and other linked devices.
+    private func confirmDelete(_ m: Message) {
+        guard let window = view.window, let jid = chat?.jid else { return }
+        let forEveryone = m.fromMe && m.kind != .revoked && m.kind != .pending
+            && Date().timeIntervalSince(m.date) < Self.revokeWindow
         let a = NSAlert()
-        a.messageText = "Delete this message for everyone?"
-        a.informativeText = "It will be replaced with “This message was deleted” for everyone in the chat."
-        a.addButton(withTitle: "Delete for Everyone")
+        a.messageText = "Delete message?"
+        a.informativeText = forEveryone
+            ? "Delete for Everyone leaves “This message was deleted” in the chat. Delete for Me removes it from this Mac, your phone and your other linked devices."
+            : "It's removed from this Mac, your phone and your other linked devices."
+        if forEveryone { a.addButton(withTitle: "Delete for Everyone").hasDestructiveAction = true }
+        a.addButton(withTitle: "Delete for Me").hasDestructiveAction = true
         a.addButton(withTitle: "Cancel")
-        a.buttons.first?.hasDestructiveAction = true
-        a.beginSheetModal(for: window) { [weak self] resp in
-            guard resp == .alertFirstButtonReturn else { return }
-            MainActor.assumeIsolated {
-                _ = Core.shared.call("revoke", ["chat": self?.chat?.jid ?? "", "id": m.id])
+        a.beginSheetModal(for: window) { resp in
+            let pick = resp.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            let action = forEveryone ? [0: "revoke", 1: "delete_for_me"][pick] : [0: "delete_for_me"][pick]
+            guard let action else { return }
+            Task { @MainActor in
+                let r = await Core.shared.callAsync(action, ["chat": jid, "id": m.id])
+                if r["error"] != nil { NSSound.beep() }
             }
         }
     }

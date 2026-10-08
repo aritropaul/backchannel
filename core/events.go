@@ -92,6 +92,8 @@ func (a *App) handle(evt any) {
 		a.onDeleteChat(e)
 	case *events.ClearChat:
 		a.onClearChat(e)
+	case *events.DeleteForMe:
+		a.onDeleteForMe(e)
 	case *events.Star:
 		chat := a.canon(e.ChatJID).String()
 		a.db.Exec(`UPDATE messages SET starred=? WHERE chat=? AND id=?`, b2i(e.Action.GetStarred()), chat, e.MessageID)
