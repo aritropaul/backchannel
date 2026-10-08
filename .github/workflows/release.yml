@@ -1,11 +1,13 @@
 # Releases Backchannel when a version tag is pushed:
 #
-#   make release VERSION=0.3      (tags v0.3 on main as pushed, and pushes the tag)
+#   make release VERSION=0.4 NOTES=notes.md   (tags v0.4 on main as pushed, with the
+#                                               release notes as the tag's message, and pushes it)
 #
 # tools/release/release.sh does the work: archive, sign with the team's Developer ID
 # certificate, notarize and staple, the branded disk image, the update signature (checked
 # against the key the app carries), then the GitHub release with the DMG, its SHA-256 and
-# appcast.xml, which installed copies read once a day.
+# appcast.xml, which installed copies read once a day. The tag's notes head the release
+# and show in the app's update window.
 #
 # Actions › Release › Run workflow builds a version from the branch you pick. With
 # "publish" off it stops before the GitHub release (a dry run of the whole pipeline); with

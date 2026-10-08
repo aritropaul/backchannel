@@ -63,19 +63,21 @@ dmg: app
 # Releases come from GitHub Actions (.github/workflows/release.yml, which runs
 # tools/release/release.sh): this tags main as pushed and pushes the tag.
 release:
-	@[ -n "$(VERSION)" ] || { echo "usage: make release VERSION=0.3"; exit 1; }
+	@[ -n "$(VERSION)" ] && [ -n "$(NOTES)" ] || { echo "usage: make release VERSION=0.4 NOTES=notes.md   (the release notes, in Markdown)"; exit 1; }
+	@[ -s "$(NOTES)" ] || { echo "$(NOTES) is missing or empty."; exit 1; }
 	@[ -z "$$(git status --porcelain)" ] || { echo "Commit your changes first: a release is built from main as pushed."; exit 1; }
 	@git fetch -q origin main
 	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { echo "HEAD isn't origin/main. Push main first."; exit 1; }
 	@! git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null || { echo "v$(VERSION) is already tagged."; exit 1; }
-	git tag v$(VERSION)
+	@# An annotated tag: "Backchannel x", then the notes, kept verbatim (## isn't a comment).
+	{ echo "Backchannel $(VERSION)"; echo; cat "$(NOTES)"; } | git tag -a --cleanup=verbatim -F - v$(VERSION)
 	git push origin v$(VERSION)
 	@echo "GitHub Actions is releasing v$(VERSION): https://github.com/aritropaul/backchannel/actions/workflows/release.yml"
 
 # The same release built and signed on this Mac, through Xcode's account.
 # PUBLISH=0 stops before publishing.
 release-local:
-	VERSION="$(VERSION)" PUBLISH="$(PUBLISH)" tools/release/release.sh
+	VERSION="$(VERSION)" PUBLISH="$(PUBLISH)" NOTES="$(NOTES)" tools/release/release.sh
 
 # The static site in site/ links the DMG next to index.html.
 site: dmg

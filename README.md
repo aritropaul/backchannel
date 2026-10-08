@@ -80,10 +80,10 @@ Coming from a build named WA: the first launch quits if WA is still running, the
 ## Releasing
 
 ```sh
-make release VERSION=0.3
+make release VERSION=0.4 NOTES=notes.md
 ```
 
-That tags main as pushed (`v0.3`) and pushes the tag, and GitHub Actions does the rest (`.github/workflows/release.yml`, running `tools/release/release.sh` on a `macos-26` runner with Xcode 26.3). It archives the app, signs it with the team's Developer ID certificate, notarizes it with an App Store Connect API key, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and checks that signature against the key the app carries, then publishes the release with the DMG, its SHA-256 and `appcast.xml`. The version comes from the tag, the build number from the commit count. Actions › Release › Run workflow builds a version from a branch; with "publish" off it's a dry run that keeps the DMG as an artifact. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
+That tags main as pushed with an annotated tag (`v0.4`) whose message is the release notes, pushes the tag, and GitHub Actions does the rest (`.github/workflows/release.yml`, running `tools/release/release.sh` on a `macos-26` runner with Xcode 26.3). It archives the app, signs it with the team's Developer ID certificate, notarizes it with an App Store Connect API key, staples the ticket, packs the branded DMG, checks it with Gatekeeper, signs the DMG for updates and checks that signature against the key the app carries, then publishes the release with the DMG, its SHA-256 and `appcast.xml`. The notes are Markdown (`###` headings, `-` lists); they head the GitHub release and go into the appcast, so the app's update window shows them. The version comes from the tag, the build number from the commit count. Actions › Release › Run workflow builds a version from a branch; with "publish" off it's a dry run that keeps the DMG as an artifact. The hardened runtime uses the entitlements in `app/Backchannel.entitlements` (camera, microphone and Photos).
 
 The workflow reads these repository secrets (Settings › Secrets and variables › Actions), and its first step names any that are missing:
 
@@ -92,7 +92,7 @@ The workflow reads these repository secrets (Settings › Secrets and variables 
 - `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8`: the App Store Connect API key that notarizes ("Backchannel CI", a team key)
 - `SPARKLE_PRIVATE_KEY`: the update key (below)
 
-`make release-local VERSION=0.3` runs the same pipeline on this Mac instead, signing and notarizing through Xcode's account (the Apple ID under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud) and reading the update key from the login keychain. `PUBLISH=0 make release-local VERSION=0.3` stops before publishing.
+`make release-local VERSION=0.4 NOTES=notes.md` runs the same pipeline on this Mac instead, signing and notarizing through Xcode's account (the Apple ID under Xcode › Settings › Accounts; Xcode manages the certificate in the cloud) and reading the update key from the login keychain. `PUBLISH=0 make release-local VERSION=0.4` stops before publishing.
 
 Installed copies update through [Sparkle](https://sparkle-project.org). Once a day they read `appcast.xml` from the latest release, and they install a download only if its EdDSA signature matches the public key in `app/Sources/Info.plist` (`SUPublicEDKey`). The private key was made with Sparkle's `generate_keys --account backchannel` and lives in the login keychain on the Mac that made it; CI gets it as `SPARKLE_PRIVATE_KEY` (`generate_keys --account backchannel -x <file>` exports it). Keep a copy somewhere safe: without it, installed copies can't be updated.
 

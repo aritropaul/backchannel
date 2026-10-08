@@ -1,12 +1,17 @@
 #!/bin/sh
 # A signed, notarized release, published on GitHub. Releases come from GitHub Actions:
 #
-#   make release VERSION=0.3   # tags v0.3 and pushes the tag; .github/workflows/release.yml runs this
+#   make release VERSION=0.4 NOTES=notes.md   # tags v0.4 with the notes and pushes the tag;
+#                                             # .github/workflows/release.yml runs this
 #
 # and the same pipeline runs on this Mac too:
 #
-#   make release-local VERSION=0.3
-#   PUBLISH=0 make release-local VERSION=0.3   # everything but the GitHub release
+#   make release-local VERSION=0.4 NOTES=notes.md
+#   PUBLISH=0 make release-local VERSION=0.4   # everything but the GitHub release
+#
+# The release notes (Markdown: ### headings, - lists) come from NOTES when it's set, or
+# else from the annotated tag's message after its first line. They head the GitHub
+# release and go into the appcast, so the update window shows them too.
 #
 # Signing depends on where it runs:
 # - SIGNING=keychain (CI): the Developer ID certificate the workflow imported into a
@@ -66,6 +71,25 @@ echo "Backchannel $VERSION ($BUILD), signed through $SIGNING"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
+
+BODY="$OUT/notes-body.md"
+if [ -n "${NOTES:-}" ]; then
+  cp "$NOTES" "$BODY"
+else
+  # The tag as pushed: a checkout can leave an annotated tag looking lightweight.
+  git fetch -q --force origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+  if [ "$(git cat-file -t "refs/tags/$TAG" 2>/dev/null)" = tag ]; then
+    git tag -l --format='%(contents:body)' "$TAG" > "$BODY"
+  else
+    : > "$BODY"
+  fi
+fi
+if [ -s "$BODY" ]; then
+  echo "Release notes: $(grep -c . "$BODY") lines"
+else
+  echo "No release notes (make release takes NOTES=file)."
+fi
+
 make core project
 
 # Xcode's archive copies are never meant to be opened; keep LaunchServices pointing at
@@ -178,6 +202,8 @@ printf '%s' "$SIGNATURE" | sed -E 's/.*edSignature="([^"]+)".*/\1/' | base64 -d 
 "$OPENSSL" pkeyutl -verify -pubin -keyform DER -inkey "$OUT/update-key.der" -rawin -in "$DMG" -sigfile "$OUT/update.sig" >/dev/null || {
   echo "The disk image's update signature doesn't match SUPublicEDKey in Info.plist: wrong update key."; exit 1; }
 APPCAST="$ROOT/build/appcast.xml"
+DESCRIPTION=""
+[ -s "$BODY" ] && DESCRIPTION="<description><![CDATA[$(/usr/bin/python3 tools/release/notes_html.py < "$BODY")]]></description>"
 cat > "$APPCAST" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
@@ -190,6 +216,7 @@ cat > "$APPCAST" <<EOF
       <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
       <sparkle:fullReleaseNotesLink>https://github.com/$REPO/releases/tag/$TAG</sparkle:fullReleaseNotesLink>
+      $DESCRIPTION
       <enclosure url="https://github.com/$REPO/releases/download/$TAG/Backchannel-$VERSION.dmg" $SIGNATURE type="application/octet-stream"/>
     </item>
   </channel>
@@ -203,19 +230,25 @@ if [ "$PUBLISH" != 1 ]; then
   exit 0
 fi
 
-NOTES="$OUT/notes.md"
+RELEASE_NOTES="$OUT/release-notes.md"
 {
-  echo "Backchannel $VERSION for macOS 26 Tahoe on Apple silicon."
+  if [ -s "$BODY" ]; then
+    cat "$BODY"
+    echo
+    echo "---"
+    echo
+  fi
+  echo "Backchannel $VERSION for macOS 26 Tahoe on Apple silicon. Signed with Developer ID and notarized by Apple."
+  echo
+  echo "Already on 0.3 or later? It updates itself within a day, or now from Backchannel › Check for Updates…"
   echo
   echo "Unofficial. Not affiliated with WhatsApp or Meta."
-  echo
-  echo "Signed with Developer ID and notarized by Apple."
-} > "$NOTES"
+} > "$RELEASE_NOTES"
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   # Only CI gets here: a re-run of a tag whose release went up half finished.
   gh release upload "$TAG" "$DMG" "$DMG.sha256" "$APPCAST" -R "$REPO" --clobber
 else
   gh release create "$TAG" "$DMG" "$DMG.sha256" "$APPCAST" -R "$REPO" --target "$(git rev-parse HEAD)" \
-    --title "Backchannel $VERSION" --notes-file "$NOTES" --generate-notes
+    --title "Backchannel $VERSION" --notes-file "$RELEASE_NOTES" --generate-notes
 fi
 echo "Released $TAG: https://github.com/$REPO/releases/tag/$TAG"
