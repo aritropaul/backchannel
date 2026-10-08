@@ -405,6 +405,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
             leadInset = 10
         }
         [title, sub, close].forEach(strip.addSubview)
+        // A long link title, file name or quoted line truncates. At the default 750 it beat
+        // the split view's holding priority (~250) and the window's drag (510): the sidebar
+        // squeezed to its compact column, the window widened and then couldn't shrink.
+        [title, sub].forEach { $0.setContentCompressionResistancePriority(.init(200), for: .horizontal) }
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: lead, constant: leadInset),
             title.topAnchor.constraint(equalTo: strip.topAnchor, constant: image != nil ? 13 : 10),
