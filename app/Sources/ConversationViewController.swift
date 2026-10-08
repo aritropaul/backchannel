@@ -2,9 +2,9 @@ import AppKit
 import Quartz
 
 /// Root view of the conversation: paints the canvas edge to edge (including
-/// under the floating sidebar) and accepts dropped images.
+/// under the floating sidebar) and takes dropped files, any number of them.
 final class DropView: NSView {
-    var onDrop: ((URL) -> Void)?
+    var onDrop: (([URL]) -> Void)?
     /// A chat theme's picture (gradient or photo), aspect-filled under everything.
     private let wallpaper = CALayer()
     /// Washes a photo toward the canvas so text and bubbles stay readable.
@@ -58,19 +58,20 @@ final class DropView: NSView {
         needsDisplay = true
     }
 
-    private func fileURL(_ info: NSDraggingInfo) -> URL? {
+    private func fileURLs(_ info: NSDraggingInfo) -> [URL] {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         return (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: opts) as? [URL])?
-            .first { !$0.hasDirectoryPath }
+            .filter { !$0.hasDirectoryPath } ?? []
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        fileURL(sender) != nil && onDrop != nil ? .copy : []
+        !fileURLs(sender).isEmpty && onDrop != nil ? .copy : []
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let url = fileURL(sender) else { return false }
-        onDrop?(url)
+        let urls = fileURLs(sender)
+        guard !urls.isEmpty else { return false }
+        onDrop?(urls)
         return true
     }
 }
@@ -132,11 +133,9 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     var reloading = false
     var replyTo: Message?
     var editing: Message?
-    var pendingImage: (path: String, thumb: String, w: Int, h: Int)?
-    var pendingFile: PendingFile?
-    /// More files picked with the one in the composer; they follow it when it's sent.
-    var queuedAttachments: [URL] = []
-    var queueAsDocuments = false
+    /// Files in the composer's tray, in sending order; the selected one's caption is in the field.
+    var attachments: [Attachment] = []
+    var selectedAttachment = 0
     /// The photo viewer, while it's open.
     var viewer: MediaViewer?
     var inlineVideo: InlineVideo?
@@ -150,7 +149,7 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     var typing: [String: (name: String, until: Date)] = [:]
     private var presence: (online: Bool, lastSeen: Date?)?
     var pendingOpen: String?
-    private var previewURL: URL?
+    var previewURL: URL?
     var highlighted: String?
     /// Reactions of mine still flying from the menu to their message (message id → emoji).
     var landing: [String: String] = [:]
@@ -178,7 +177,7 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
 
     override func loadView() {
         let root = DropView()
-        root.onDrop = { [weak self] url in self?.attach(url) }
+        root.onDrop = { [weak self] urls in self?.attachMany(urls, asDocuments: false) }
         view = root
 
         scrollView.drawsBackground = false
@@ -314,12 +313,10 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
         presence = nil
         replyTo = nil
         editing = nil
-        pendingImage = nil
-        pendingFile = nil
         expanded = []
         layouts = [:]
         composer.hideReply(animated: false)
-        composer.hideAttachment(animated: false)
+        clearAttachments(animated: false)
         guard let c else {
             msgs = []
             rows = [.spacer]

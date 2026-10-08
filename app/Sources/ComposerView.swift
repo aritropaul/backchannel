@@ -10,7 +10,12 @@ protocol ComposerDelegate: AnyObject {
     func composerExpressions(from anchor: NSView)
     func composerCancelReply()
     func composerCancelAttachment()
+    func composerSelectAttachment(_ index: Int)
+    func composerRemoveAttachment(_ index: Int)
+    func composerOpenAttachment(_ index: Int)
+    func composerAddAttachments(from anchor: NSView)
     func composerPasteImage(_ image: NSImage) -> Bool
+    func composerPasteFiles(_ urls: [URL]) -> Bool
 }
 
 struct LinkPreview {
@@ -33,6 +38,10 @@ final class PlaceholderTextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
+        // Files copied in Finder come as files (their icon is on the pasteboard too).
+        let files = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])?
+            .filter { !$0.hasDirectoryPath } ?? []
+        if !files.isEmpty, composer?.delegate?.composerPasteFiles(files) == true { return }
         if !(pb.types?.contains(.string) ?? false) || (pb.types?.contains(.tiff) ?? false) || (pb.types?.contains(.png) ?? false),
            let img = NSImage(pasteboard: pb), composer?.delegate?.composerPasteImage(img) == true {
             return
@@ -106,7 +115,7 @@ final class GlassRim: NSView {
 }
 
 /// iMessage-style composer: (+)  [ Message…        ≋/↑ ]  (☺)
-/// Reply, attachment and link-preview strips sit inside the capsule above the text.
+/// The reply strip, the attachment tray and the link preview sit inside the capsule above the text.
 final class ComposerView: NSView, NSTextViewDelegate {
     weak var delegate: ComposerDelegate?
 
@@ -136,10 +145,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private let replyText = NSTextField(labelWithString: "")
     private let replyClose = NSButton()
 
-    private let attachStrip = NSView()
-    private let attachImage = NSImageView()
-    private let attachLabel = NSTextField(labelWithString: "")
-    private let attachClose = NSButton()
+    private let tray = AttachmentTray()
 
     private let linkStrip = NSView()
     private let linkImage = NSImageView()
@@ -228,17 +234,17 @@ final class ComposerView: NSView, NSTextViewDelegate {
         content.addSubview(stack)
 
         buildReply()
-        buildAttach()
+        buildTray()
         buildLink()
         buildRow()
         buildRecord()
 
-        for v in [replyStrip, attachStrip, linkStrip, row, recordRow] {
+        for v in [replyStrip, tray, linkStrip, row, recordRow] {
             stack.addArrangedSubview(v)
             v.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         replyStrip.isHidden = true
-        attachStrip.isHidden = true
+        tray.isHidden = true
         linkStrip.isHidden = true
         recordRow.isHidden = true
 
@@ -431,11 +437,11 @@ final class ComposerView: NSView, NSTextViewDelegate {
         strip(replyStrip, bar: replyBar, image: nil, title: replyName, sub: replyText, close: replyClose, closeAction: #selector(cancelReply))
     }
 
-    private func buildAttach() {
-        label(attachLabel, .systemFont(ofSize: 12.5, weight: .medium), .labelColor)
-        let sub = NSTextField(labelWithString: "Add a caption, then press Return")
-        label(sub, .systemFont(ofSize: 11.5), .secondaryLabelColor)
-        strip(attachStrip, bar: nil, image: attachImage, title: attachLabel, sub: sub, close: attachClose, closeAction: #selector(cancelAttachment))
+    private func buildTray() {
+        tray.onSelect = { [weak self] i in self?.delegate?.composerSelectAttachment(i) }
+        tray.onRemove = { [weak self] i in self?.delegate?.composerRemoveAttachment(i) }
+        tray.onOpen = { [weak self] i in self?.delegate?.composerOpenAttachment(i) }
+        tray.onAdd = { [weak self] anchor in self?.delegate?.composerAddAttachments(from: anchor) }
     }
 
     private func buildLink() {
@@ -476,20 +482,25 @@ final class ComposerView: NSView, NSTextViewDelegate {
 
     func hideReply(animated: Bool) { setStrip(replyStrip, visible: false, animated: animated) }
 
-    func showAttachment(_ image: NSImage, label: String) {
-        attachImage.image = image
-        attachLabel.stringValue = label
-        setStrip(attachStrip, visible: true, animated: true)
+    /// The files waiting to go, the selected one ringed (its caption is what's in the field).
+    func showAttachments(_ items: [TrayItem], selected: Int, info: String, captionless: Bool) {
+        let opening = tray.isHidden
+        tray.set(items, selected: selected, info: info, animated: !opening)
+        textView.placeholder = captionless ? "Add a message" : "Add a caption"
+        textView.needsDisplay = true
+        if opening { setStrip(tray, visible: true, animated: true) }
         updateAction()
     }
 
-    func hideAttachment(animated: Bool) {
-        setStrip(attachStrip, visible: false, animated: animated)
-        attachImage.image = nil
+    func hideAttachments(animated: Bool) {
+        setStrip(tray, visible: false, animated: animated)
+        tray.set([], selected: 0, info: "", animated: false)
+        textView.placeholder = "Message"
+        textView.needsDisplay = true
         updateAction()
     }
 
-    var hasAttachment: Bool { !attachStrip.isHidden }
+    var hasAttachment: Bool { !tray.isHidden }
 
     private func setStrip(_ strip: NSView, visible: Bool, animated: Bool) {
         guard strip.isHidden == visible else { return }

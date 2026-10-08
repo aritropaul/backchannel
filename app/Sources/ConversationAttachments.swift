@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
 import AVKit
+import QuickLookThumbnailing
+import Quartz
 import UniformTypeIdentifiers
 
 /// A non-photo attachment waiting in the composer: a video (re-encoded to mp4
@@ -18,51 +20,271 @@ struct PendingFile {
     var isVideo: Bool { mime.hasPrefix("video/") && thumb != nil }
 }
 
-extension ConversationViewController {
-    /// Routes a picked or dropped file: photos keep the photo flow, videos are
-    /// prepared for WhatsApp, anything else goes as a document.
-    func attach(_ url: URL) {
-        guard chat != nil else { return }
-        let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? UTType(filenameExtension: url.pathExtension) ?? .data
-        if type.conforms(to: .image) {
-            pendingFile = nil
-            prepareImage(url)
-        } else if type.conforms(to: .movie) {
-            prepareVideo(url)
-        } else {
-            prepareDocument(url, type: type)
-        }
+/// A file waiting in the composer's tray. It's made ready for WhatsApp as soon as it's
+/// added (photos re-encoded, videos made mp4), so sending doesn't wait on it, and it
+/// carries its own caption.
+final class Attachment {
+    enum Kind { case photo, video, document, audio }
+    enum Payload {
+        case photo(path: String, thumb: String, w: Int, h: Int)
+        case file(PendingFile)
     }
 
-    func prepareDocument(_ url: URL, type: UTType) {
-        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        guard size > 0, size <= 2_000_000_000 else { NSSound.beep(); return }   // WhatsApp's document limit is 2 GB
-        pendingImage = nil
-        pendingFile = PendingFile(path: url.path, name: url.lastPathComponent, mime: type.preferredMIMEType ?? "application/octet-stream")
-        composer.showAttachment(NSWorkspace.shared.icon(forFile: url.path),
-                                label: "\(url.lastPathComponent) · \(Fmt.bytes(size))\(queuedSuffix)")
+    let id = UUID()
+    let url: URL
+    var kind: Kind
+    var caption = ""
+    var image: NSImage?
+    var payload: Payload?
+    var task: Task<Payload?, Never>?
+    /// What the line under the tray says when this one is selected.
+    var info: String
+    var badge: String?
+
+    init(url: URL, kind: Kind, info: String) {
+        self.url = url
+        self.kind = kind
+        self.info = info
+    }
+
+    var name: String { url.lastPathComponent.hasPrefix("paste-") ? "Pasted image" : url.lastPathComponent }
+    var tray: TrayItem { TrayItem(id: id, image: image, preparing: payload == nil, badge: badge, name: name) }
+
+    /// Ready to send: now, or once its preparation finishes (nil if that failed).
+    func prepared() async -> Payload? {
+        if let payload { return payload }
+        return await task?.value
+    }
+}
+
+extension ConversationViewController {
+    /// WhatsApp sends up to 100 files at once.
+    static let maxAttachments = 100
+
+    /// Adds files to the tray after the ones already there: photos keep the photo flow,
+    /// videos are prepared for WhatsApp, anything else goes as a document. `asDocuments`
+    /// sends photos and videos as files at full quality (the Document picker).
+    func attachMany(_ urls: [URL], asDocuments: Bool) {
+        attachFiles(urls.map { url in
+            let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType)
+                ?? UTType(filenameExtension: url.pathExtension) ?? .data
+            if asDocuments { return (url, .document) }
+            if type.conforms(to: .image) { return (url, .photo) }
+            if type.conforms(to: .movie) { return (url, .video) }
+            return (url, .document)
+        })
+    }
+
+    func attachFiles(_ files: [(URL, Attachment.Kind)]) {
+        guard chat != nil, !files.isEmpty else { return }
+        let room = Self.maxAttachments - attachments.count
+        if files.count > room { NSSound.beep() }
+        var added: [Attachment] = []
+        for (url, kind) in files.prefix(max(0, room)) {
+            if let a = prepare(url, kind) { added.append(a) }
+        }
+        guard !added.isEmpty else { return }
+        attachments += added
+        refreshTray()
         composer.focus()
     }
 
-    private func prepareVideo(_ url: URL) {
-        let jid = chat?.jid
-        pendingImage = nil
-        pendingFile = nil
-        composer.showAttachment(NSImage(systemSymbolName: "video", accessibilityDescription: nil) ?? NSImage(), label: "Preparing video…")
+    private func prepare(_ url: URL, _ kind: Attachment.Kind) -> Attachment? {
+        switch kind {
+        case .document:
+            let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            guard size > 0, size <= 2_000_000_000 else { NSSound.beep(); return nil }   // WhatsApp's document limit is 2 GB
+            let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? UTType(filenameExtension: url.pathExtension)
+            let a = Attachment(url: url, kind: .document, info: "\(url.lastPathComponent) · \(Fmt.bytes(size))")
+            a.payload = .file(PendingFile(path: url.path, name: url.lastPathComponent,
+                                          mime: type?.preferredMIMEType ?? "application/octet-stream"))
+            thumbnail(a)
+            return a
+        case .photo:
+            let a = Attachment(url: url, kind: .photo, info: "Photo")
+            a.info = a.name == "Pasted image" ? "Pasted image" : a.name
+            a.task = Task { await Self.encodePhoto(url).map { .photo(path: $0.path, thumb: $0.thumb, w: $0.w, h: $0.h) } }
+            thumbnail(a)
+            finish(a) { a, p in
+                if case .photo(_, _, let w, let h) = p { a.info += " · \(w)×\(h)" }
+            }
+            return a
+        case .video:
+            let a = Attachment(url: url, kind: .video, info: "\(url.lastPathComponent) · Preparing…")
+            a.task = Task { await Self.encodeVideo(url).map { .file($0) } }
+            thumbnail(a)
+            finish(a) { a, p in
+                guard case .file(let f) = p else { return }
+                a.info = "\(a.name) · \(Fmt.duration(f.seconds))"
+                a.badge = Fmt.duration(f.seconds)
+                if let t = f.thumb.flatMap(NSImage.init(contentsOfFile:)), a.image == nil { a.image = t }
+            }
+            return a
+        case .audio:
+            let a = Attachment(url: url, kind: .audio, info: "\(url.deletingPathExtension().lastPathComponent) · Preparing…")
+            a.image = Self.attachIcon("headphones", NSColor(hex: 0xFA6533), size: 112)
+            a.task = Task {
+                guard let out = await Self.encodeAudio(url) else { return nil }
+                // Over 16 MB, music goes as a document.
+                if out.size > 16_000_000 {
+                    let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? .audio
+                    return .file(PendingFile(path: url.path, name: url.lastPathComponent, mime: type.preferredMIMEType ?? "audio/mpeg"))
+                }
+                return .file(out.file)
+            }
+            finish(a) { a, p in
+                guard case .file(let f) = p else { return }
+                if f.isAudio {
+                    a.info = "\(url.deletingPathExtension().lastPathComponent) · \(Fmt.duration(f.seconds))"
+                    a.badge = Fmt.duration(f.seconds)
+                } else {
+                    a.kind = .document
+                    a.info = "\(url.lastPathComponent) · \(Fmt.bytes(Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)))"
+                }
+            }
+            return a
+        }
+    }
+
+    /// Waits for a file's preparation, then shows the result; a file that can't be
+    /// prepared leaves the tray with a beep.
+    private func finish(_ a: Attachment, _ apply: @escaping (Attachment, Attachment.Payload) -> Void) {
         Task { [weak self] in
-            let out = await Self.encodeVideo(url)
-            guard let self, self.chat?.jid == jid else { return }
-            guard let out else {
+            let p = await a.task?.value
+            guard let self, self.attachments.contains(where: { $0 === a }) else { return }
+            guard let p else {
                 NSSound.beep()
-                self.composer.hideAttachment(animated: true)
+                if let i = self.attachments.firstIndex(where: { $0 === a }) { self.composerRemoveAttachment(i) }
                 return
             }
-            self.pendingFile = out
-            let thumb = out.thumb.flatMap { NSImage(contentsOfFile: $0) }
-                ?? NSImage(systemSymbolName: "video", accessibilityDescription: nil) ?? NSImage()
-            self.composer.showAttachment(thumb, label: "Video · \(Fmt.duration(out.seconds))\(self.queuedSuffix)")
-            self.composer.focus()
+            a.payload = p
+            apply(a, p)
+            self.refreshTray()
         }
+    }
+
+    /// The tile's picture: Quick Look's thumbnail (a PDF's first page, a photo, a video
+    /// frame), or the file's icon.
+    private func thumbnail(_ a: Attachment) {
+        let px = AttachmentTray.side * 2
+        let request = QLThumbnailGenerator.Request(fileAt: a.url, size: CGSize(width: px, height: px), scale: 1,
+                                                   representationTypes: .all)
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] rep, _ in
+            let box = UncheckedBox(value: rep?.nsImage)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    a.image = box.value ?? NSWorkspace.shared.icon(forFile: a.url.path)
+                    if self.attachments.contains(where: { $0 === a }) { self.refreshTray() }
+                }
+            }
+        }
+    }
+
+    /// Shows the tray as the attachments are now, or hides it when there are none.
+    func refreshTray() {
+        guard !attachments.isEmpty else {
+            selectedAttachment = 0
+            composer.hideAttachments(animated: true)
+            return
+        }
+        selectedAttachment = min(selectedAttachment, attachments.count - 1)
+        let a = attachments[selectedAttachment]
+        let info = attachments.count > 1 ? "\(a.info) · \(selectedAttachment + 1) of \(attachments.count)" : a.info
+        composer.showAttachments(attachments.map(\.tray), selected: selectedAttachment, info: info,
+                                 captionless: a.kind == .audio)
+    }
+
+    /// Empties the tray (switching chats, Esc).
+    func clearAttachments(animated: Bool = true) {
+        attachments.forEach { $0.task?.cancel() }
+        attachments = []
+        selectedAttachment = 0
+        composer.hideAttachments(animated: animated)
+    }
+
+    /// Sends every file in the tray, in order, each with its own caption; the reply quote
+    /// goes with the first. Audio has no caption, so its text follows as a message.
+    func sendAttachments(caption: String) {
+        guard let c = chat, !attachments.isEmpty else { return }
+        attachments[selectedAttachment].caption = caption
+        let items = attachments, quote = replyTo?.id ?? "", jid = c.jid
+        Task { [weak self] in
+            for (i, a) in items.enumerated() {
+                guard let p = await a.prepared() else { continue }
+                let text = a.caption.trimmingCharacters(in: .whitespacesAndNewlines)
+                var args: [String: Any] = ["chat": jid, "quote": i == 0 ? quote : ""]
+                let op: String
+                var after = ""
+                switch p {
+                case .photo(let path, let thumb, let w, let h):
+                    op = "send_image"
+                    args.merge(["path": path, "thumb": thumb, "width": w, "height": h, "mime": "image/jpeg", "text": text]) { $1 }
+                case .file(let f) where f.isAudio:
+                    op = "send_audio"
+                    args.merge(["path": f.path, "name": f.name, "mime": f.mime, "seconds": f.seconds]) { $1 }
+                    after = text
+                case .file(let f):
+                    op = "send_file"
+                    args.merge(["path": f.path, "name": f.name, "mime": f.mime, "text": text, "thumb": f.thumb ?? "",
+                                "width": f.width, "height": f.height, "seconds": f.seconds]) { $1 }
+                }
+                let res = await Core.shared.callAsync(op, args)
+                if let err = res["error"] as? String {
+                    NSSound.beep()
+                    NSLog("send failed: %@", err)
+                    // Nothing went: give the files back rather than lose them.
+                    if i == 0, let self, self.chat?.jid == jid, self.attachments.isEmpty {
+                        self.attachments = items
+                        self.selectedAttachment = 0
+                        self.composer.text = items[0].caption
+                        self.refreshTray()
+                    }
+                    return
+                }
+                if i == 0, Prefs.outgoingSound { NSSound(named: "Pop")?.play() }
+                if !after.isEmpty { _ = await Core.shared.callAsync("send_text", ["chat": jid, "text": after]) }
+            }
+        }
+        attachments = []
+        selectedAttachment = 0
+        composer.hideAttachments(animated: true)
+    }
+
+    // MARK: tray actions
+
+    func composerSelectAttachment(_ index: Int) {
+        guard attachments.indices.contains(index), index != selectedAttachment else { return }
+        attachments[selectedAttachment].caption = composer.text
+        selectedAttachment = index
+        composer.text = attachments[index].caption
+        refreshTray()
+        composer.focus()
+    }
+
+    func composerRemoveAttachment(_ index: Int) {
+        guard attachments.indices.contains(index) else { return }
+        attachments[index].task?.cancel()
+        attachments.remove(at: index)
+        if index < selectedAttachment {
+            selectedAttachment -= 1
+        } else if index == selectedAttachment, !attachments.isEmpty {
+            // The removed file's caption goes with it; the next one's comes up.
+            selectedAttachment = min(index, attachments.count - 1)
+            composer.text = attachments[selectedAttachment].caption
+        }
+        refreshTray()
+    }
+
+    func composerOpenAttachment(_ index: Int) {
+        guard attachments.indices.contains(index) else { return }
+        previewURL = attachments[index].url
+        QLPreviewPanel.shared()?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The tray's +: more of the same, documents after documents, photos and videos otherwise.
+    func composerAddAttachments(from anchor: NSView) {
+        if attachments.first?.kind == .document { pickDocuments() } else { pickMedia() }
     }
 
     /// Re-encodes to H.264 mp4 (fits 1280×720), which every WhatsApp client

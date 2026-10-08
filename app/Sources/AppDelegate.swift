@@ -354,8 +354,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let f = env["WA_FILTER"].flatMap(Int.init) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.list.pickFilter(f) }
         }
-        if let path = env["WA_ATTACH"] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak main] in main?.convo.attach(URL(fileURLWithPath: path)) }
+        if let paths = env["WA_ATTACH"] {
+            // Dev: files for the composer's tray, several separated by "|".
+            let urls = paths.split(separator: "|").map { URL(fileURLWithPath: String($0)) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak main] in main?.convo.attachMany(urls, asDocuments: false) }
         }
         if let id = env["WA_JUMP"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak main] in main?.convo.jump(to: id) }

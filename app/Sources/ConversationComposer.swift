@@ -8,8 +8,8 @@ extension ConversationViewController: ComposerDelegate {
 
     func composerSend(_ text: String) {
         guard let c = chat else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let e = editing {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty && trimmed != e.text {
                 Core.shared.call("edit", ["chat": c.jid, "id": e.id, "text": trimmed])
             }
@@ -18,20 +18,9 @@ extension ConversationViewController: ComposerDelegate {
             composer.text = ""
             return
         }
-        var res: [String: Any]
-        var textAfter = ""
-        if let f = pendingFile, f.isAudio {
-            // Audio has no caption; any text goes after it as its own message.
-            res = Core.shared.call("send_audio", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime,
-                                                  "seconds": f.seconds, "quote": replyTo?.id ?? ""])
-            textAfter = trimmed
-        } else if let f = pendingFile {
-            res = Core.shared.call("send_file", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime, "text": trimmed,
-                                                 "thumb": f.thumb ?? "", "width": f.width, "height": f.height,
-                                                 "seconds": f.seconds, "quote": replyTo?.id ?? ""])
-        } else if let img = pendingImage {
-            res = Core.shared.call("send_image", ["chat": c.jid, "path": img.path, "thumb": img.thumb, "width": img.w, "height": img.h,
-                                                  "mime": "image/jpeg", "text": trimmed, "quote": replyTo?.id ?? ""])
+        if !attachments.isEmpty {
+            // The tray's files, each with its caption; the field holds the selected one's.
+            sendAttachments(caption: text)
         } else {
             let text = Prefs.emojiReplace ? Emoticons.replace(text) : text
             var args: [String: Any] = ["chat": c.jid, "text": text, "quote": replyTo?.id ?? ""]
@@ -40,23 +29,18 @@ extension ConversationViewController: ComposerDelegate {
                 args["link_title"] = p.title
                 args["thumb"] = p.thumbPath ?? ""
             }
-            res = Core.shared.call("send_text", args)
+            let res = Core.shared.call("send_text", args)
+            if let err = res["error"] as? String {
+                NSSound.beep()
+                NSLog("send failed: %@", err)
+                return
+            }
+            if Prefs.outgoingSound { NSSound(named: "Pop")?.play() }
         }
-        if let err = res["error"] as? String {
-            NSSound.beep()
-            NSLog("send failed: %@", err)
-            return
-        }
-        if Prefs.outgoingSound { NSSound(named: "Pop")?.play() }
-        if !textAfter.isEmpty { _ = Core.shared.call("send_text", ["chat": c.jid, "text": textAfter]) }
-        sendQueuedAttachments()
         composer.text = ""
         drafts[c.jid] = nil
         replyTo = nil
-        pendingImage = nil
-        pendingFile = nil
         composer.hideReply(animated: true)
-        composer.hideAttachment(animated: true)
         typingStop?.cancel()
         lastTypingSent = .distantPast
     }
@@ -112,39 +96,24 @@ extension ConversationViewController: ComposerDelegate {
     }
 
     func composerCancelAttachment() {
-        pendingImage = nil
-        pendingFile = nil
-        queuedAttachments = []
-        composer.hideAttachment(animated: true)
+        clearAttachments()
     }
 
     func composerPasteImage(_ image: NSImage) -> Bool {
         guard chat != nil, let tiff = image.tiffRepresentation else { return false }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("paste-\(UUID().uuidString).tiff")
         guard (try? tiff.write(to: url)) != nil else { return false }
-        prepareImage(url)
+        attachFiles([(url, .photo)])
+        return true
+    }
+
+    func composerPasteFiles(_ urls: [URL]) -> Bool {
+        guard chat != nil else { return false }
+        attachMany(urls, asDocuments: false)
         return true
     }
 
     /// Re-encodes to JPEG (≤2560px) plus a small inline thumbnail, off the main thread.
-    func prepareImage(_ url: URL) {
-        guard chat != nil else { return }
-        let jid = chat?.jid
-        DispatchQueue.global(qos: .userInitiated).async {
-            let out = ConversationViewController.encode(url)
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let out, self.chat?.jid == jid else { NSSound.beep(); return }
-                    self.pendingImage = (out.path, out.thumb, out.w, out.h)
-                    if let img = NSImage(contentsOfFile: out.thumb) {
-                        self.composer.showAttachment(img, label: "Photo · \(out.w)×\(out.h)\(self.queuedSuffix). Add a caption, then press Return.")
-                    }
-                    self.composer.focus()
-                }
-            }
-        }
-    }
-
     @concurrent nonisolated static func encodePhoto(_ url: URL) async -> (path: String, thumb: String, w: Int, h: Int)? {
         encode(url)
     }

@@ -118,53 +118,11 @@ extension ConversationViewController {
         }
     }
 
-    /// The first file waits in the composer for a caption; the rest follow it when it's sent.
-    func attachMany(_ urls: [URL], asDocuments: Bool) {
-        guard let first = urls.first else { return }
-        queuedAttachments = Array(urls.dropFirst())
-        queueAsDocuments = asDocuments
-        if asDocuments {
-            let type = (try? first.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? .data
-            prepareDocument(first, type: type)
-        } else {
-            attach(first)
-        }
-    }
-
-    /// " · 3 more" after the attachment label when several files were picked.
-    var queuedSuffix: String { queuedAttachments.isEmpty ? "" : " · \(queuedAttachments.count) more" }
-
-    /// Sends the files picked along with the one that carried the caption, in order.
-    func sendQueuedAttachments() {
-        guard let c = chat, !queuedAttachments.isEmpty else { return }
-        let urls = queuedAttachments, docs = queueAsDocuments
-        queuedAttachments = []
-        Task { @MainActor in
-            for url in urls {
-                let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType)
-                    ?? UTType(filenameExtension: url.pathExtension) ?? .data
-                if docs || !(type.conforms(to: .image) || type.conforms(to: .movie)) {
-                    _ = await Core.shared.callAsync("send_file", ["chat": c.jid, "path": url.path, "name": url.lastPathComponent,
-                                                                  "mime": type.preferredMIMEType ?? "application/octet-stream"])
-                } else if type.conforms(to: .movie) {
-                    guard let f = await Self.encodeVideo(url) else { continue }
-                    _ = await Core.shared.callAsync("send_file", ["chat": c.jid, "path": f.path, "name": f.name, "mime": f.mime,
-                                                                  "thumb": f.thumb ?? "", "width": f.width, "height": f.height,
-                                                                  "seconds": f.seconds])
-                } else {
-                    guard let out = await Self.encodePhoto(url) else { continue }
-                    _ = await Core.shared.callAsync("send_image", ["chat": c.jid, "path": out.path, "thumb": out.thumb,
-                                                                   "width": out.w, "height": out.h, "mime": "image/jpeg"])
-                }
-            }
-        }
-    }
-
     // MARK: Camera
 
     func openCamera() {
         let cam = CameraViewController()
-        cam.onPhoto = { [weak self] url in self?.prepareImage(url) }
+        cam.onPhoto = { [weak self] url in self?.attachFiles([(url, .photo)]) }
         presentAsSheet(cam)
     }
 
@@ -174,40 +132,17 @@ extension ConversationViewController {
         guard let window = view.window else { return }
         let p = NSOpenPanel()
         p.allowedContentTypes = [.audio]
-        p.allowsMultipleSelection = false
+        p.allowsMultipleSelection = true
         p.beginSheetModal(for: window) { [weak self] resp in
-            guard resp == .OK, let url = p.url else { return }
-            MainActor.assumeIsolated { self?.prepareAudio(url) }
+            guard resp == .OK else { return }
+            let urls = p.urls
+            MainActor.assumeIsolated { self?.attachFiles(urls.map { ($0, .audio) }) }
         }
     }
 
     /// Music goes as audio (the player bubble). WhatsApp plays MP3, AAC/M4A, OGG/Opus and
-    /// AMR; anything else is converted to M4A. Over 16 MB it goes as a document instead.
-    func prepareAudio(_ url: URL) {
-        guard let c = chat else { return }
-        pendingImage = nil
-        pendingFile = nil
-        queuedAttachments = []
-        composer.showAttachment(Self.attachIcon("headphones", NSColor(hex: 0xFA6533), size: 40), label: "Preparing audio…")
-        Task { [weak self] in
-            let out = await Self.encodeAudio(url)
-            guard let self, self.chat?.jid == c.jid else { return }
-            guard let out else {
-                NSSound.beep()
-                self.composer.hideAttachment(animated: true)
-                return
-            }
-            if out.size > 16_000_000 {
-                self.prepareDocument(url, type: (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? .audio)
-                return
-            }
-            self.pendingFile = out.file
-            self.composer.showAttachment(Self.attachIcon("headphones", NSColor(hex: 0xFA6533), size: 40),
-                                         label: "\(url.deletingPathExtension().lastPathComponent) · \(Fmt.duration(out.file.seconds)). Press Return to send.")
-            self.composer.focus()
-        }
-    }
-
+    /// AMR; anything else is converted to M4A. Over 16 MB it goes as a document instead
+    /// (`Attachment` decides, from the size this returns).
     @concurrent nonisolated static func encodeAudio(_ url: URL) async -> (file: PendingFile, size: Int64)? {
         let asset = AVURLAsset(url: url)
         let seconds = (try? await asset.load(.duration)).map { CMTimeGetSeconds($0) } ?? 0
