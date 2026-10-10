@@ -43,6 +43,10 @@ enum Prefs {
     static var notifyReactions: Bool { bool("WA.notify.reactions", true) }
     static var notifyGroupReactions: Bool { bool("WA.notify.groupReactions", true) }
     static var outgoingSound: Bool { bool("WA.sound.outgoing", false) }
+    /// Voice message transcripts (Settings › Chats): the language ("" follows the Mac's), and
+    /// whether voice notes transcribe themselves (on arrival, and older ones on screen).
+    static var transcriptLanguage: String { string("WA.transcripts.language", "") }
+    static var autoTranscribe: Bool { bool("WA.transcripts.auto", true) }
 
     /// "Reset notification settings": back to WhatsApp's defaults.
     static func resetNotifications() {

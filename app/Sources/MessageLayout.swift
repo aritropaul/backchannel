@@ -13,6 +13,7 @@ final class MessageLayout {
         var expanded = false
         var gutter = false       // incoming in a group: room for sender avatars
         var showAvatar = false   // last bubble of an incoming group run
+        var transcript: TranscriptPhase?   // a voice note's transcript being made
     }
 
     let msg: Message
@@ -50,6 +51,10 @@ final class MessageLayout {
     private var playRect: CGRect?
     private var waveRect: CGRect?
     private var durationRect: CGRect?
+    /// A voice note's transcript (or its progress) under the waveform.
+    private var transcriptBlock: TextBlock?
+    private var transcriptOrigin = CGPoint.zero
+    private var transcriptRect: CGRect?
     private(set) var cardRect: CGRect?
     private var cardBanner: CGRect?
     private var cardSquare: CGRect?
@@ -492,14 +497,22 @@ final class MessageLayout {
         let fromMe = msg.fromMe
         var y = Self.padV
         var quoteH: CGFloat = 0
-        let w = min(maxBubble, 250)
+        var w = min(maxBubble, 250)
+        if transcriptText() != nil { w = min(maxBubble, 300) }
         if !msg.quoteID.isEmpty {
             quoteH = buildQuote(maxWidth: w - 2 * Self.padH - 6)
             y += quoteH + 5
         }
         let rowH: CGFloat = 30
+        let words = transcriptText()
         let x = fromMe ? width - Self.edge - w : lead
-        let h = y + rowH + Self.padV
+        var h = y + rowH + Self.padV
+        if let words {
+            let t = TextBlock(words, maxWidth: w - 2 * Self.padH)
+            transcriptBlock = t
+            transcriptOrigin = CGPoint(x: Self.padH, y: y + rowH + 5)
+            h = transcriptOrigin.y + t.size.height + Self.padV + 1
+        }
         let b = CGRect(x: x, y: top, width: w, height: h)
         bubble = b
         tail = flags.lastInRun
@@ -509,7 +522,31 @@ final class MessageLayout {
         let durW: CGFloat = 34
         waveRect = CGRect(x: playRect!.maxX + 6, y: rowY + 3, width: w - 30 - 8 - 6 - durW - 12, height: rowH - 6)
         durationRect = CGRect(x: b.maxX - Self.padH - durW, y: rowY, width: durW, height: rowH)
+        if let t = transcriptBlock {
+            transcriptOrigin = CGPoint(x: b.minX + transcriptOrigin.x, y: b.minY + transcriptOrigin.y)
+            transcriptRect = CGRect(origin: transcriptOrigin, size: t.size)
+        }
         return b.maxY
+    }
+
+    /// The transcript under the waveform, or what's happening to it, all in the bubble's
+    /// secondary ink: the text at 13pt, progress and problems at 12.5pt.
+    private func transcriptText() -> NSAttributedString? {
+        let fromMe = msg.fromMe
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = 1.5
+        func line(_ s: String, _ color: NSColor, _ font: NSFont) -> NSAttributedString {
+            NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color, .paragraphStyle: para])
+        }
+        let soft = Theme.secondaryInk(fromMe: fromMe)
+        switch flags.transcript {
+        case .working?: return line("Transcribing…", soft, .systemFont(ofSize: 12.5))
+        case .preparing(let language)?: return line("Getting \(language) ready…", soft, .systemFont(ofSize: 12.5))
+        case .failed(let why)?: return line("Couldn't transcribe. \(why)", soft, .systemFont(ofSize: 12.5))
+        case nil:
+            let t = msg.transcript
+            return t.isEmpty ? nil : line(t, soft, .systemFont(ofSize: 13))
+        }
     }
 
     private var bars: [CGFloat] {
@@ -567,6 +604,27 @@ final class MessageLayout {
             .foregroundColor: Theme.secondaryInk(fromMe: fromMe)])
         let ts = t.size()
         t.draw(at: CGPoint(x: dr.maxX - ts.width, y: dr.midY - ts.height / 2))
+        if let block = transcriptBlock {
+            block.highlight(first: spokenLength(block.storage.length), color: strong)
+            block.draw(at: transcriptOrigin)
+        }
+    }
+
+    /// How much of the transcript has been said so far while the note plays: up to the
+    /// next word not yet reached (so punctuation lights with its word). Transcripts saved
+    /// without word timings follow the playback fraction, to a word boundary. Muted again
+    /// once playback ends.
+    private func spokenLength(_ length: Int) -> Int {
+        guard flags.transcript == nil, !msg.transcript.isEmpty, let t = AudioPlayback.shared.time(msg.id) else { return 0 }
+        let words = msg.transcriptWords
+        if !words.isEmpty {
+            guard let first = words.first, t >= first.start else { return 0 }
+            return words.first { $0.start > t }?.range.location ?? length
+        }
+        let ns = msg.transcript as NSString
+        var n = Int(Double(length) * AudioPlayback.shared.progress(msg.id))
+        while n < length, n > 0, ns.character(at: n - 1) != 0x20 { n += 1 }
+        return n
     }
 
     // MARK: link card
@@ -712,7 +770,7 @@ final class MessageLayout {
         }
         if let m = mediaRect, m.contains(p) { return .media }
         if let c = cardRect, c.contains(p), let u = cardURL { return .link(u) }
-        if playRect != nil, let b = bubble, b.contains(p) { return .voice }
+        if playRect != nil, let b = bubble, b.contains(p), transcriptRect?.contains(p) != true { return .voice }
         if let f = fileRect, f.contains(p) { return .file }
         if let r = docPreviewRect, r.contains(p) { return .file }
         if let q = quoteRect, q.contains(p) { return .quote }

@@ -56,6 +56,7 @@ extension ConversationViewController: NSTableViewDataSource, NSTableViewDelegate
             flags.showAvatar = flags.gutter && flags.lastInRun
             flags.status = m.id == lastOutgoing ? Self.statusText(m) : nil
             flags.expanded = expanded.contains(m.id)
+            flags.transcript = Transcripts.shared.phase(m.id)
             let l: MessageLayout
             if let old = layouts[m.id], old.msg == m, abs(old.width - width) < 0.5, old.flags == flags {
                 l = old
@@ -359,6 +360,7 @@ extension ConversationViewController: NSTableViewDataSource, NSTableViewDelegate
             if v.playerView != nil, inlineVideo?.id != l.msg.id { stopInline() }   // its cell was reused
             v.highlight = l.msg.id == highlighted
             if l.wantsAutoDownload { Core.shared.call("download", ["chat": chat?.jid ?? "", "id": l.msg.id]) }
+            if let jid = chat?.jid { Transcripts.shared.shown(l.msg, in: jid) }
             fillWaveformIfNeeded(l.msg)
             requestThumbIfNeeded(l.msg)
             return v

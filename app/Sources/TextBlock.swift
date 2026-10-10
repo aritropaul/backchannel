@@ -33,6 +33,15 @@ final class TextBlock {
         }
     }
 
+    /// Recolours the first `count` characters for drawing only (a playing transcript's
+    /// spoken words): temporary attributes don't lay the text out again.
+    func highlight(first count: Int, color: NSColor) {
+        let all = NSRange(location: 0, length: storage.length)
+        layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: all)
+        let n = min(max(count, 0), storage.length)
+        if n > 0 { layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: NSRange(location: 0, length: n)) }
+    }
+
     func draw(at p: CGPoint) {
         let range = layoutManager.glyphRange(for: container)
         layoutManager.drawBackground(forGlyphRange: range, at: p)

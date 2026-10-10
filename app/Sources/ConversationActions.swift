@@ -194,6 +194,17 @@ extension ConversationViewController {
                 NSPasteboard.general.setString(m.text, forType: .string)
             }
         }
+        if m.kind == .voice || m.kind == .audio {
+            let t = m.transcript
+            if !t.isEmpty {
+                item("Copy Transcript", "text.quote") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(t, forType: .string)
+                }
+            } else if Transcripts.shared.phase(m.id) != .working {
+                item("Transcribe", "text.bubble") { [weak self] in self?.transcribe(m) }
+            }
+        }
         if m.hasMedia || !m.mediaPath.isEmpty {
             item("Open", "eye") { [weak self] in self?.open(media: m) }
             if m.kind != .sticker {

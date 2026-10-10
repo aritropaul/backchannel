@@ -20,6 +20,12 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate {
         return p.currentTime / p.duration
     }
 
+    /// Where a playing (or paused) note is, in seconds; nil when it isn't the current one.
+    func time(_ id: String) -> TimeInterval? {
+        guard currentID == id, let p = player else { return nil }
+        return p.currentTime
+    }
+
     func elapsed(_ id: String) -> Int? {
         guard currentID == id, let p = player else { return nil }
         return Int(p.currentTime.rounded(.down))
@@ -65,7 +71,8 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate {
         if let old { onTick?(old) }
     }
 
-    nonisolated private static func playableURL(_ src: URL) -> URL? {
+    /// Something AVFoundation can read: Ogg Opus decoded once to a CAF beside it.
+    nonisolated static func playableURL(_ src: URL) -> URL? {
         let isOgg = src.pathExtension.lowercased() == "ogg" || (try? Data(contentsOf: src, options: .mappedIfSafe).prefix(4)) == Data("OggS".utf8)
         guard isOgg else { return src }
         let caf = src.deletingPathExtension().appendingPathExtension("caf")

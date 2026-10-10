@@ -62,6 +62,7 @@ type req struct {
 	Retry       bool         `json:"retry"`      // download: ask the phone to re-upload expired media
 	GifSource   string       `json:"gif_source"` // send_file: "giphy" or "tenor", credited on the GIF
 	Mentions    []mention    `json:"mentions"`   // send_text: the people @-mentioned in Text
+	Times       [][]float64  `json:"times"`      // set_transcript: [start, end, location, length] per word
 }
 
 // mention is one @-mention: Text carries it as "@" + Name, the wire as "@" + the user part.
@@ -343,6 +344,31 @@ func (a *App) sendText(q req) (any, error) {
 		a.deliver(chat, id, msg)
 	}()
 	return map[string]any{"id": id}, nil
+}
+
+// setTranscript keeps a voice note's on-device transcript (made in Swift) in its extra
+// JSON, with the language it was heard in. It stays on this Mac.
+func (a *App) setTranscript(chat, id, text, lang string, times [][]float64) error {
+	var extra string
+	if err := a.rdb.QueryRow(`SELECT extra FROM messages WHERE chat=? AND id=?`, chat, id).Scan(&extra); err != nil {
+		return err
+	}
+	obj := map[string]any{}
+	if extra != "" && json.Unmarshal([]byte(extra), &obj) != nil {
+		return errors.New("this message's extra isn't JSON")
+	}
+	obj["transcript"], obj["transcript_lang"] = text, lang
+	if len(times) > 0 {
+		obj["transcript_times"] = times // so playback can light the words as they're said
+	} else {
+		delete(obj, "transcript_times")
+	}
+	b, _ := json.Marshal(obj)
+	if _, err := a.db.Exec(`UPDATE messages SET extra=? WHERE chat=? AND id=?`, string(b), chat, id); err != nil {
+		return err
+	}
+	a.touchMsg(chat, id)
+	return nil
 }
 
 // lidMentions rewrites phone-number mentions as LIDs in a group that addresses its

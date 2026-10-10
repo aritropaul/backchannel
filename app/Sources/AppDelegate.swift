@@ -23,11 +23,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         self.store = store
         Avatars.shared.store = store
+        Transcripts.shared.store = store
         NotificationCenter.default.addObserver(forName: Prefs.changed, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateBadge() }
         }
         let main = MainWindowController(store: store)
         self.wc = main
+        Transcripts.shared.onChange = { [weak main] chat, id in
+            if chat == main?.convo.chat?.jid { main?.convo.transcriptChanged(id) }
+        }
         core.observe { [weak self] e in self?.handle(e) }
 
         // Paired: paint straight from the local store, before the network.
@@ -471,10 +475,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case .chats, .reload:
             scheduleBadge()
         case .notify(let chat, let id, let title, let body, let muted, let reaction):
-            if !reaction { PhotoSaver.shared.incoming(chat: chat, id: id) }
+            if !reaction {
+                PhotoSaver.shared.incoming(chat: chat, id: id)
+                Transcripts.shared.arrived(chat: chat, id: id)
+            }
             notify(chat: chat, title: title, body: body, muted: muted, reaction: reaction)
-        case .media(let chat, let id, let status) where status == "downloaded":
-            PhotoSaver.shared.downloaded(chat: chat, id: id)
+        case .media(let chat, let id, let status):
+            if status == "downloaded" { PhotoSaver.shared.downloaded(chat: chat, id: id) }
+            Transcripts.shared.media(chat: chat, id: id, status: status)
         case .state(let s, _, _):
             if s == "syncing" { requestNotifications() }
             if s == "connected" { focusChanged() }

@@ -431,7 +431,11 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
                     if m.kind == .voice || m.kind == .audio { AudioPlayback.shared.toggle(m) } else { self?.open(media: m) }
                 }
             }
-            if !m.fromMe && appended.contains(m.id) { typing[m.sender] = nil }
+            if !m.fromMe && appended.contains(m.id) {
+                typing[m.sender] = nil
+                // The core doesn't announce what lands in the open chat; transcribe it here.
+                if m.kind == .voice { Transcripts.shared.arrived(chat: jid, id: m.id) }
+            }
         }
         if mine {
             unreadAnchorID = nil

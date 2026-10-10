@@ -318,6 +318,11 @@ import UserNotifications
                 Form.toggle("Documents", on: Prefs.autoDocuments) { on in Prefs.set("WA.auto.documents", on) },
             ], header: "Media auto-download", footer: "Downloads start when the message comes on screen."),
             Form.group([
+                transcriptLanguageRow(),
+                Form.toggle("Transcribe automatically", detail: "Voice messages are transcribed as soon as they arrive. Otherwise, right-click one and choose Transcribe.",
+                            on: Prefs.autoTranscribe) { on in Prefs.set("WA.transcripts.auto", on) },
+            ], header: "Voice message transcripts", footer: "Transcripts are made on this Mac. The audio never leaves it, and only you see them."),
+            Form.group([
                 Form.toggle("Save to Photos", detail: "Photos and videos you receive are added to your Photos library. Each chat can override this in its info.",
                             on: Prefs.saveToPhotos) { on in Prefs.set("WA.saveToPhotos", on) },
             ]),
@@ -329,6 +334,34 @@ import UserNotifications
                 },
             ], header: "Chat history"),
         ]
+    }
+
+    /// The transcript language: Automatic (the Mac's own) or any language this Mac can
+    /// transcribe. The list comes from Speech, so it fills in a moment after the pane opens.
+    private func transcriptLanguageRow() -> FormRow {
+        let p = NSPopUpButton(frame: .zero, pullsDown: false)
+        p.addItem(withTitle: "Automatic")
+        p.lastItem?.representedObject = ""
+        let current = Prefs.transcriptLanguage
+        if !current.isEmpty {
+            p.addItem(withTitle: Transcriber.name(current))
+            p.lastItem?.representedObject = current
+            p.select(p.lastItem)
+        }
+        let row = FormRow(title: "Language", detail: nil, accessory: p)
+        row.bind(p) { if let v = p.selectedItem?.representedObject as? String { Prefs.set("WA.transcripts.language", v) } }
+        Task { [weak p] in
+            let auto = await Transcriber.locale(preferred: "")
+            let all = await Transcriber.languages()
+            guard let p else { return }
+            p.item(at: 0)?.title = auto.map { "Automatic (\(Transcriber.name($0.identifier)))" } ?? "Automatic"
+            p.menu?.addItem(.separator())
+            for l in all where l.identifier != current {
+                p.addItem(withTitle: Transcriber.name(l.identifier))
+                p.lastItem?.representedObject = l.identifier
+            }
+        }
+        return row
     }
 
     // MARK: Notifications
