@@ -47,19 +47,40 @@ nonisolated enum OggOpus {
         return Stream(channels: max(1, channels), preSkip: preSkip, packets: Array(packets.dropFirst(2)))
     }
 
-    private static func opusFormat(channels: Int) -> AVAudioFormat? {
+    /// `framesPerPacket` 0 means each packet says its own length (decoding what phones send).
+    private static func opusFormat(channels: Int, framesPerPacket: UInt32 = 960) -> AVAudioFormat? {
         var asbd = AudioStreamBasicDescription(mSampleRate: sampleRate, mFormatID: kAudioFormatOpus, mFormatFlags: 0,
-                                               mBytesPerPacket: 0, mFramesPerPacket: 960, mBytesPerFrame: 0,
+                                               mBytesPerPacket: 0, mFramesPerPacket: framesPerPacket, mBytesPerFrame: 0,
                                                mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 0, mReserved: 0)
         return AVAudioFormat(streamDescription: &asbd)
     }
 
+    /// A packet's length in 48 kHz samples, from its TOC byte (RFC 6716 §3.1): the frame
+    /// size its configuration implies, times the frames it carries.
+    static func frames(_ p: Data) -> Int {
+        guard let toc = p.first else { return 0 }
+        let config = Int(toc >> 3)
+        let tenthsOfMs = switch config {
+        case 0...11: [100, 200, 400, 600][config % 4]   // SILK
+        case 12...15: [100, 200][config % 2]            // hybrid
+        default: [25, 50, 100, 200][config % 4]         // CELT
+        }
+        let count = switch toc & 3 {
+        case 0: 1
+        case 1, 2: 2
+        default: p.count > 1 ? Int(p[p.startIndex + 1] & 0x3F) : 0
+        }
+        return tenthsOfMs * 48 / 10 * count
+    }
+
     // MARK: decode
 
-    /// Decodes a whole voice note to 48 kHz float PCM (they're short).
+    /// Decodes a whole voice note to 48 kHz float PCM (they're short). Phones pack several
+    /// frames into a packet (often 120 ms, six 20 ms SILK frames), so every packet carries
+    /// its own length; a fixed 960 made AudioToolbox reject them as bad data.
     static func decode(_ url: URL) throws -> AVAudioPCMBuffer {
         let stream = try demux(Data(contentsOf: url))
-        guard let inFmt = opusFormat(channels: stream.channels),
+        guard let inFmt = opusFormat(channels: stream.channels, framesPerPacket: 0),
               let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
                                          channels: AVAudioChannelCount(stream.channels), interleaved: false),
               let conv = AVAudioConverter(from: inFmt, to: outFmt) else { throw Failure.codec("converter") }
@@ -82,7 +103,7 @@ nonisolated enum OggOpus {
                 p.withUnsafeBytes { raw in
                     if let base = raw.baseAddress { buf.data.copyMemory(from: base, byteCount: p.count) }
                 }
-                buf.packetDescriptions?.pointee = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0,
+                buf.packetDescriptions?.pointee = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: UInt32(frames(p)),
                                                                                 mDataByteSize: UInt32(p.count))
                 buf.packetCount = 1
                 buf.byteLength = UInt32(p.count)
