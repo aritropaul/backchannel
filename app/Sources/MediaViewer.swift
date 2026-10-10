@@ -335,25 +335,8 @@ final class MediaViewer: NSView {
 
     /// Copies the photo into Downloads, named like WhatsApp's own saves.
     @objc private func savePhoto() {
-        guard let url = currentURL, let m = current,
-              let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return }
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
-        var dest = downloads.appendingPathComponent("WhatsApp Image \(f.string(from: m.date)).\(ext)")
-        var n = 2
-        while FileManager.default.fileExists(atPath: dest.path) {
-            dest = downloads.appendingPathComponent("WhatsApp Image \(f.string(from: m.date)) (\(n)).\(ext)")
-            n += 1
-        }
-        do {
-            try FileManager.default.copyItem(at: url, to: dest)
-            // Bounces the Downloads stack in the Dock, as Safari's downloads do.
-            DistributedNotificationCenter.default().post(name: .init("com.apple.DownloadFileFinished"), object: dest.path)
-            save.flash(symbol: "checkmark")
-        } catch {
-            NSSound.beep()
-        }
+        guard currentURL != nil, let m = current else { return }
+        if Downloads.save(m) != nil { save.flash(symbol: "checkmark") }
     }
 
     @objc private func replyToPhoto() {

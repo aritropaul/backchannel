@@ -15,6 +15,16 @@ extension ConversationViewController {
         composer.focus()
     }
 
+    /// Copies the attachment into ~/Downloads, fetching it first if it isn't on this Mac yet.
+    func saveToDownloads(_ m: Message) {
+        if !m.mediaPath.isEmpty, FileManager.default.fileExists(atPath: m.mediaPath) {
+            Downloads.save(m)
+            return
+        }
+        pendingSave.insert(m.id)
+        Core.shared.call("download", ["chat": chat?.jid ?? "", "id": m.id, "retry": true])
+    }
+
     func toggleVoice(_ m: Message) {
         if m.mediaPath.isEmpty {
             pendingOpen = m.id
@@ -177,7 +187,10 @@ extension ConversationViewController {
             }
         }
         if m.hasMedia || !m.mediaPath.isEmpty {
-            item(m.mediaPath.isEmpty ? "Download" : "Open", m.mediaPath.isEmpty ? "arrow.down.circle" : "eye") { [weak self] in self?.open(media: m) }
+            item("Open", "eye") { [weak self] in self?.open(media: m) }
+            if m.kind != .sticker {
+                item("Save to Downloads", "arrow.down.circle") { [weak self] in self?.saveToDownloads(m) }
+            }
             if !m.mediaPath.isEmpty {
                 item("Show in Finder", "folder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: m.mediaPath)]) }
             }

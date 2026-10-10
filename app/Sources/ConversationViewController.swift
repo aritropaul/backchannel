@@ -149,6 +149,8 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     var typing: [String: (name: String, until: Date)] = [:]
     private var presence: (online: Bool, lastSeen: Date?)?
     var pendingOpen: String?
+    /// Attachments to copy into Downloads once they finish downloading.
+    var pendingSave: Set<String> = []
     var previewURL: URL?
     var highlighted: String?
     /// Reactions of mine still flying from the menu to their message (message id → emoji).
@@ -398,6 +400,11 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
                 appended.insert(m.id)
                 if m.fromMe { mine = true }
             }
+            if pendingSave.contains(m.id), !m.mediaPath.isEmpty {
+                pendingSave.remove(m.id)
+                Downloads.save(m)
+            }
+
             if m.id == pendingOpen, !m.mediaPath.isEmpty {
                 pendingOpen = nil
                 DispatchQueue.main.async { [weak self] in
@@ -458,11 +465,12 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     }
 
     func mediaFailed(id: String, status: String) {
-        // Auto-downloads fail quietly (the thumbnail stays); only explain user-initiated opens.
-        guard pendingOpen == id else { return }
+        // Auto-downloads fail quietly (the thumbnail stays); only explain user-initiated opens and saves.
+        guard pendingOpen == id || pendingSave.contains(id) else { return }
         // The server dropped it and the phone was asked to upload it again: keep waiting.
         if status == "retrying" { return }
-        pendingOpen = nil
+        if pendingOpen == id { pendingOpen = nil }
+        pendingSave.remove(id)
         NSSound.beep()
         if status == "expired", let window = view.window {
             let a = NSAlert()
