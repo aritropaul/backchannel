@@ -152,6 +152,8 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     /// Attachments to copy into Downloads once they finish downloading.
     var pendingSave: Set<String> = []
     var previewURL: URL?
+    /// The message Quick Look is showing, so it can zoom out of (and back into) its bubble.
+    var previewSource: String?
     var highlighted: String?
     /// Reactions of mine still flying from the menu to their message (message id → emoji).
     var landing: [String: String] = [:]
@@ -561,6 +563,7 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
             panel.dataSource = nil
             panel.delegate = nil
             previewURL = nil
+            previewSource = nil
         }
     }
 
@@ -570,6 +573,22 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
 
     nonisolated func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
         MainActor.assumeIsolated { previewURL as NSURL? }
+    }
+
+    nonisolated func previewPanel(_ panel: QLPreviewPanel!, sourceFrameOnScreenFor item: (any QLPreviewItem)!) -> NSRect {
+        MainActor.assumeIsolated { previewSourceView().map { $0.window?.convertToScreen($0.convert($1, to: nil)) ?? .zero } ?? .zero }
+    }
+
+    nonisolated func previewPanel(_ panel: QLPreviewPanel!, transitionImageFor item: (any QLPreviewItem)!,
+                                  contentRect: UnsafeMutablePointer<NSRect>!) -> Any! {
+        MainActor.assumeIsolated { UncheckedBox(value: previewSource.flatMap { layouts[$0]?.documentImage }) }.value
+    }
+
+    /// The bubble Quick Look zooms from, and the document's frame in it.
+    private func previewSourceView() -> (NSView, NSRect)? {
+        guard let id = previewSource, let row = rowIndex(of: id), let l = layouts[id], let frame = l.documentFrame,
+              let v = tableView.view(atColumn: 0, row: row, makeIfNecessary: false), !v.visibleRect.isEmpty else { return nil }
+        return (v, frame)
     }
 }
 

@@ -1,4 +1,5 @@
 import AppKit
+import Quartz
 import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -369,6 +370,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.showSettings(nil)
                 if let s = env["WA_SETTINGS_SECTION"].flatMap(SettingsSection.init) { self?.settings?.show(s) }
+            }
+        }
+        if env["WA_DEMO_OPEN"] != nil || env["WA_MENTION_DEMO"] != nil || env["WA_SHEET_DEMO"] != nil {
+            // Dev demos run in my own chat only: select it first, whatever chat was open last.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.wc?.list.select(jid: Core.shared.me) }
+        }
+        if let id = env["WA_DEMO_OPEN"] {
+            // Dev: opens a message's attachment as a click does (downloading it first if needed),
+            // at WA_DEMO_OPEN_AT seconds; Quick Look closes 12 s later.
+            let at = env["WA_DEMO_OPEN_AT"].flatMap(Double.init) ?? 2.2
+            DispatchQueue.main.asyncAfter(deadline: .now() + at) { [weak self] in
+                guard let c = self?.wc?.convo, c.chat?.jid == Core.shared.me,
+                      let m = self?.store?.message(chat: Core.shared.me, id: id) else { return }
+                c.open(media: m)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 12) { QLPreviewPanel.shared()?.orderOut(nil) }
             }
         }
         if let secs = env["WA_SETTINGS_TONES"].flatMap(Double.init) {

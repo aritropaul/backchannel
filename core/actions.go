@@ -314,6 +314,18 @@ func (a *App) sendText(q req) (any, error) {
 	return map[string]any{"id": id}, nil
 }
 
+
+// mergeExtra sets one key in a row's extra JSON object, leaving the rest alone.
+func mergeExtra(extra, key string, v any) string {
+	obj := map[string]any{}
+	if extra != "" && json.Unmarshal([]byte(extra), &obj) != nil {
+		return extra // some other kind's JSON we shouldn't touch
+	}
+	obj[key] = v
+	b, _ := json.Marshal(obj)
+	return string(b)
+}
+
 // localEcho writes the outgoing row before the network round-trip so the
 // bubble appears on the very next frame.
 func (a *App) localEcho(r *msgRow, chat types.JID) {

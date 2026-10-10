@@ -219,7 +219,8 @@ func (a *App) setAvatar(jid, path string) {
 }
 
 // fetchThumb downloads the small separate thumbnail of an image or video that
-// arrived without an inline JPEGThumbnail. The UI asks for visible rows.
+// arrived without an inline JPEGThumbnail, and a document's first-page preview (sharper
+// than the tiny inline one, so it replaces it). The UI asks for visible rows.
 func (a *App) fetchThumb(chat, id string) {
 	key := chat + "/" + id
 	if _, seen := a.thumbAsked.LoadOrStore(key, true); seen || a.ready() != nil {
@@ -231,17 +232,34 @@ func (a *App) fetchThumb(chat, id string) {
 	var media string
 	var has int
 	if a.rdb.QueryRow(`SELECT media, thumb IS NOT NULL FROM messages WHERE chat=? AND id=?`, chat, id).Scan(&media, &has) != nil ||
-		has == 1 || media == "" {
+		media == "" {
 		return
 	}
 	var ref mediaRef
-	if json.Unmarshal([]byte(media), &ref) != nil || ref.ThumbPath == "" {
-		a.thumbAsked.Delete(key) // a later backfill may bring the thumbnail path
+	if json.Unmarshal([]byte(media), &ref) != nil || ref.ThumbPath == "" || (has == 1 && ref.Type != "document") {
+		if ref.ThumbPath == "" {
+			a.thumbAsked.Delete(key) // a later backfill may bring the thumbnail path
+		}
 		return
 	}
 	mk, _ := base64.StdEncoding.DecodeString(ref.MediaKey)
 	sha, _ := base64.StdEncoding.DecodeString(ref.ThumbSHA)
 	esha, _ := base64.StdEncoding.DecodeString(ref.ThumbEncSHA)
+	if ref.Type == "document" {
+		// whatsmeow only knows link-preview thumbnails; a document's has its own keys and path.
+		data, err := a.cli.DownloadMediaWithPath(a.ctx, ref.ThumbPath, esha, sha, mk,
+			whatsmeow.MediaType("WhatsApp Document Thumbnail Keys"), "thumbnail-document", false)
+		if err != nil || len(data) == 0 {
+			a.log.Warnf("document thumbnail %s: %v", key, err)
+			return
+		}
+		// Done for good: drop the path so later launches don't fetch it again.
+		ref.ThumbPath, ref.ThumbSHA, ref.ThumbEncSHA = "", "", ""
+		b, _ := json.Marshal(ref)
+		a.db.Exec(`UPDATE messages SET thumb=?, media=? WHERE chat=? AND id=?`, data, string(b), chat, id)
+		a.touchMsg(chat, id)
+		return
+	}
 	var msg whatsmeow.DownloadableThumbnail
 	switch ref.Type {
 	case "image":

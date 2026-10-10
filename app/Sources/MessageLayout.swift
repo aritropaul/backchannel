@@ -36,6 +36,8 @@ final class MessageLayout {
     private var quoteName: TextBlock?
     private var quoteText: TextBlock?
     private var fileRect: CGRect?
+    /// A document's first page over its file row.
+    private var docPreviewRect: CGRect?
     private var fileTitle: TextBlock?
     private var fileSub: TextBlock?
     private var text: TextBlock?
@@ -262,8 +264,18 @@ final class MessageLayout {
         }
         let isFile = rich == nil && (msg.kind == .document || msg.kind == .contact)
         var fileY: CGFloat = 0
+        var previewY: CGFloat = 0, previewH: CGFloat = 0
         if isFile && bodyOverride == nil {
-            let rowW = min(maxText, 240)
+            var rowW = min(maxText, 240)
+            if msg.kind == .document, let img = documentPreview() {
+                // The top of the first page, the width of the card, at most a landscape slice of it.
+                rowW = min(maxText, 264)
+                let pw = rowW + 2 * Self.padH - 10
+                previewH = max(84, min(pw * img.size.height / max(img.size.width, 1), pw * 0.62)).rounded()
+                previewY = y - 2
+                docPreviewRect = .zero
+                y += previewH
+            }
             fileY = y
             buildFile(width: rowW)
             contentW = max(contentW, rowW)
@@ -301,6 +313,7 @@ final class MessageLayout {
         textOrigin = CGPoint(x: b.minX + textOrigin.x, y: b.minY + textOrigin.y + (h - y) / 2)
         if quoteH > 0 { quoteRect = CGRect(x: b.minX + 5, y: b.minY + 5, width: w - 10, height: quoteH) }
         if fileRect != nil { fileRect = CGRect(x: b.minX + 5, y: b.minY + fileY - 2, width: w - 10, height: 46) }
+        if docPreviewRect != nil { docPreviewRect = CGRect(x: b.minX + 5, y: b.minY + previewY, width: w - 10, height: previewH) }
         if rich != nil { richOrigin = CGPoint(x: b.minX + Self.padH, y: b.minY + richY) }
         return b.maxY
     }
@@ -389,7 +402,8 @@ final class MessageLayout {
         case .document:
             title = msg.fileName.isEmpty ? "Document" : msg.fileName
             let ext = (msg.fileName as NSString).pathExtension.uppercased()
-            sub = [ext.isEmpty ? nil : ext, msg.fileSize > 0 ? Fmt.bytes(msg.fileSize) : nil].compactMap { $0 }.joined(separator: " · ")
+            let pages = msg.pages > 0 ? (msg.pages == 1 ? "1 page" : "\(msg.pages) pages") : nil
+            sub = [ext.isEmpty ? nil : ext, pages, msg.fileSize > 0 ? Fmt.bytes(msg.fileSize) : nil].compactMap { $0 }.joined(separator: " · ")
         case .contact:
             title = msg.text.isEmpty ? "Contact" : msg.text
             sub = "Contact Card"
@@ -404,6 +418,21 @@ final class MessageLayout {
         fileSub = TextBlock(NSAttributedString(string: sub, attributes: [.font: Theme.small, .foregroundColor: Theme.secondaryInk(fromMe: fromMe)]),
                             maxWidth: width - 44, maxLines: 1)
     }
+
+    /// A document's preview image (its inline or fetched first page, or the Quick Look
+    /// thumbnail made from the file); tiny inline ones aren't worth showing.
+    private func documentPreview() -> NSImage? {
+        if !thumbDecoded {
+            thumbDecoded = true
+            thumbImage = ImageCache.thumb(msg.thumb)
+        }
+        guard let img = thumbImage, img.size.width >= 64, img.size.height >= 48 else { return nil }
+        return img
+    }
+
+    /// Where a click on the document zooms Quick Look from, and the picture it zooms.
+    var documentFrame: CGRect? { docPreviewRect ?? fileRect }
+    var documentImage: NSImage? { docPreviewRect != nil ? thumbImage : nil }
 
     var mapsURL: URL? {
         guard msg.kind == .location else { return nil }
@@ -656,6 +685,7 @@ final class MessageLayout {
         if let c = cardRect, c.contains(p), let u = cardURL { return .link(u) }
         if playRect != nil, let b = bubble, b.contains(p) { return .voice }
         if let f = fileRect, f.contains(p) { return .file }
+        if let r = docPreviewRect, r.contains(p) { return .file }
         if let q = quoteRect, q.contains(p) { return .quote }
         return .none
     }
@@ -725,6 +755,7 @@ final class MessageLayout {
             quoteText?.draw(at: CGPoint(x: q.minX + 11, y: q.minY + 7 + (quoteName?.size.height ?? 15)))
         }
 
+        if let r = docPreviewRect { drawDocPreview(r) }
         if let f = fileRect { drawFile(f) }
         if let rc = rich { rc.draw(at: richOrigin, onImageLoad: onImageLoad) }
         if playRect != nil { drawVoice() }
@@ -867,9 +898,45 @@ final class MessageLayout {
         return s
     }()
 
+    /// The page sits on the card's top half: aspect-filled from the top edge (where a
+    /// document's title is), with a hairline so a white page doesn't melt into a pale bubble.
+    private func drawDocPreview(_ r: CGRect) {
+        guard let img = thumbImage else { return }
+        let path = Self.card(r, top: 12, bottom: 0)
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        NSColor.white.setFill()
+        r.fill()
+        let scale = max(r.width / img.size.width, r.height / img.size.height)
+        let size = CGSize(width: img.size.width * scale, height: img.size.height * scale)
+        img.draw(in: CGRect(x: r.midX - size.width / 2, y: r.minY, width: size.width, height: size.height),
+                 from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+        NSGraphicsContext.restoreGraphicsState()
+        NSColor.black.withAlphaComponent(0.08).setStroke()
+        let rim = Self.card(r.insetBy(dx: 0.25, dy: 0.25), top: 11.75, bottom: 0)
+        rim.lineWidth = 0.5
+        rim.stroke()
+    }
+
+    /// A rounded rect with its own radius for the top and bottom corners (flipped coordinates).
+    static func card(_ r: CGRect, top: CGFloat, bottom: CGFloat) -> NSBezierPath {
+        let p = NSBezierPath()
+        p.move(to: CGPoint(x: r.minX + top, y: r.minY))
+        p.line(to: CGPoint(x: r.maxX - top, y: r.minY))
+        if top > 0 { p.appendArc(withCenter: CGPoint(x: r.maxX - top, y: r.minY + top), radius: top, startAngle: 270, endAngle: 0) }
+        p.line(to: CGPoint(x: r.maxX, y: r.maxY - bottom))
+        if bottom > 0 { p.appendArc(withCenter: CGPoint(x: r.maxX - bottom, y: r.maxY - bottom), radius: bottom, startAngle: 0, endAngle: 90) }
+        p.line(to: CGPoint(x: r.minX + bottom, y: r.maxY))
+        if bottom > 0 { p.appendArc(withCenter: CGPoint(x: r.minX + bottom, y: r.maxY - bottom), radius: bottom, startAngle: 90, endAngle: 180) }
+        p.line(to: CGPoint(x: r.minX, y: r.minY + top))
+        if top > 0 { p.appendArc(withCenter: CGPoint(x: r.minX + top, y: r.minY + top), radius: top, startAngle: 180, endAngle: 270) }
+        p.close()
+        return p
+    }
+
     private func drawFile(_ f: CGRect) {
         let fromMe = msg.fromMe
-        let bg = NSBezierPath(roundedRect: f, xRadius: 12, yRadius: 12)
+        let bg = docPreviewRect != nil ? Self.card(f, top: 0, bottom: 12) : NSBezierPath(roundedRect: f, xRadius: 12, yRadius: 12)
         Theme.tint(fromMe: fromMe).setFill()
         bg.fill()
         let icon: String

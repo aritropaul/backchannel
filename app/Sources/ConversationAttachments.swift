@@ -420,6 +420,7 @@ extension ConversationViewController {
     /// Photos and videos that arrived without an inline thumbnail: the core fetches
     /// WhatsApp's separate thumbnail (downloaded videos also get a poster frame).
     func requestThumbIfNeeded(_ m: Message) {
+        if m.kind == .document { return requestDocumentPreview(m) }
         guard m.kind == .image || m.kind == .video, m.thumb == nil, m.hasMedia, !thumbRequested.contains(m.id),
               let jid = chat?.jid else { return }
         thumbRequested.insert(m.id)
@@ -428,6 +429,40 @@ extension ConversationViewController {
             posterQueue.append((jid, m.id))
             pumpPosters()
         }
+    }
+
+    /// A document's preview: the sharp first page the sender uploaded (the core fetches it,
+    /// no download of the document), or, for a file already on this Mac, a Quick Look
+    /// thumbnail of it. Icons don't count: a file Quick Look can't draw keeps its plain row.
+    private func requestDocumentPreview(_ m: Message) {
+        guard let jid = chat?.jid else { return }
+        if m.hasMedia, !thumbRequested.contains(m.id) {
+            thumbRequested.insert(m.id)
+            Core.shared.call("thumb", ["chat": jid, "id": m.id])
+        }
+        // Once the file is here (downloaded later, or one I sent), Quick Look draws it.
+        let local = "ql:" + m.id
+        guard m.thumb == nil, !m.mediaPath.isEmpty, !thumbRequested.contains(local),
+              FileManager.default.fileExists(atPath: m.mediaPath), Self.previewable(m.mediaPath) else { return }
+        thumbRequested.insert(local)
+        let req = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: m.mediaPath), size: CGSize(width: 300, height: 400),
+                                               scale: 2, representationTypes: .thumbnail)
+        let id = m.id
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { rep, _ in
+            guard let rep, rep.type == .thumbnail,
+                  let jpeg = NSBitmapImageRep(cgImage: rep.cgImage).representation(using: .jpeg, properties: [.compressionFactor: 0.8])
+            else { return }
+            let b64 = jpeg.base64EncodedString()
+            DispatchQueue.main.async { Core.shared.call("set_thumb", ["chat": jid, "id": id, "thumb": b64]) }
+        }
+    }
+
+    /// Files Quick Look draws the content of (a page, a cover, a sheet); for the rest it
+    /// draws an icon-like picture that would only repeat the row's own icon.
+    static func previewable(_ path: String) -> Bool {
+        guard let t = UTType(filenameExtension: (path as NSString).pathExtension),
+              !t.conforms(to: .calendarEvent), !t.conforms(to: .vCard) else { return false }
+        return [UTType.pdf, .image, .epub, .presentation, .spreadsheet, .compositeContent, .text].contains { t.conforms(to: $0) }
     }
 
     /// The phone's history has no video thumbnails, so frame 1 comes from the start of

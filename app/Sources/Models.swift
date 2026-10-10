@@ -134,6 +134,13 @@ struct Message: Sendable, Equatable {
 
     var hasLinkPreview: Bool { kind == .text && !linkTitle.isEmpty }
 
+    /// A document's page count, when the sender's app sent one.
+    var pages: Int {
+        guard kind == .document, extra.contains("\"pages\""), let d = extra.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return 0 }
+        return (o["pages"] as? NSNumber)?.intValue ?? 0
+    }
+
     var date: Date { Date(timeIntervalSince1970: TimeInterval(ts) / 1000) }
     var isQuoteFromMe: Bool { !quoteSender.isEmpty && quoteSender == Core.shared.me }
 }

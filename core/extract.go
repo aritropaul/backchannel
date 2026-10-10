@@ -105,6 +105,11 @@ func (a *App) content(m *waE2E.Message, r *msgRow) bool {
 			r.FileName = x.GetTitle()
 		}
 		r.FileSize, r.Media = int64(x.GetFileLength()), refFor(x, "document")
+		// The first page's shape and the page count, for the bubble's preview.
+		r.Width, r.Height = int(x.GetThumbnailWidth()), int(x.GetThumbnailHeight())
+		if n := x.GetPageCount(); n > 0 {
+			r.Extra = mergeExtra(r.Extra, "pages", n)
+		}
 	case m.GetStickerMessage() != nil:
 		x := m.GetStickerMessage()
 		r.Kind, ci = KSticker, x.GetContextInfo()

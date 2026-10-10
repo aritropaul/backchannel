@@ -1,4 +1,5 @@
 import AppKit
+import Quartz
 
 /// What can be done to a message: reply, jump, open its media, the message menu with
 /// the tapback bar, reactions (and their flight), edit and delete.
@@ -117,6 +118,13 @@ extension ConversationViewController {
                 showViewer(m)
             } else if m.kind == .sticker {
                 return   // a sticker is part of the conversation, not a photo to open
+            } else if m.kind == .document {
+                // Quick Look, zooming out of the bubble; its toolbar opens the file in its app.
+                previewURL = url
+                previewSource = m.id
+                if let panel = QLPreviewPanel.shared() {
+                    if panel.isVisible { panel.reloadData() } else { panel.makeKeyAndOrderFront(nil) }
+                }
             } else {
                 NSWorkspace.shared.open(url)
             }
