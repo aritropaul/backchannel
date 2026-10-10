@@ -141,6 +141,10 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     var inlineVideo: InlineVideo?
     var waveformTried: Set<String> = []
     var thumbRequested: Set<String> = []
+    /// Links I sent without a preview, asked for (once a session) and waiting their turn.
+    var linkRequested: Set<String> = []
+    var linkQueue: [(chat: String, id: String, url: URL)] = []
+    var linksInFlight = 0
     var posterQueue: [(chat: String, id: String)] = []
     var postersInFlight = 0
     var drafts: [String: String] = [:]
@@ -442,7 +446,9 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
             unreadCount = 0
         }
         let follow = !appended.isEmpty && (wasBottom || mine)
-        apply(buildRows(), animateIn: appended, scroll: follow ? .bottomAnimated : .anchor)
+        // At the bottom, a message that grows (a link preview or transcript arriving) keeps the
+        // chat pinned there instead of sliding under the composer.
+        apply(buildRows(), animateIn: appended, scroll: follow ? .bottomAnimated : wasBottom ? .bottom : .anchor)
         updateHeader()
     }
 

@@ -871,7 +871,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     /// WhatsApp wants a small JPEG thumbnail embedded in the message.
-    nonisolated private static func writeThumb(_ img: NSImage) -> String? {
+    nonisolated static func writeThumb(_ img: NSImage) -> String? {
         guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
         let maxSide: CGFloat = 300
         let s = min(1, maxSide / CGFloat(max(cg.width, cg.height)))

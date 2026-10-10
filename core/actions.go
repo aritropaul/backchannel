@@ -104,6 +104,10 @@ func call(raw []byte) (out any) {
 		go a.backfill(r.Chat)
 	case "thumb":
 		go a.fetchThumb(r.Chat, r.ID)
+	case "set_link_preview":
+		err = a.setLinkPreview(r.Chat, r.ID, r.LinkURL, r.LinkTitle, r.LinkDesc, r.Thumb)
+	case "set_transcript":
+		err = a.setTranscript(r.Chat, r.ID, r.Text, r.Label, r.Times)
 	case "video_prefix":
 		res, err = a.videoPrefix(r.Chat, r.ID, r.Bytes)
 	case "set_thumb":
@@ -344,6 +348,33 @@ func (a *App) sendText(q req) (any, error) {
 		a.deliver(chat, id, msg)
 	}()
 	return map[string]any{"id": id}, nil
+}
+
+// setLinkPreview fills in, on this Mac only, the preview a link came without (sent before
+// the preview was ready, or from a device that doesn't make them). An empty title records
+// that the page has none, so it isn't asked again.
+func (a *App) setLinkPreview(chat, id, url, title, desc, thumbPath string) error {
+	var thumb []byte
+	if thumbPath != "" {
+		thumb, _ = os.ReadFile(thumbPath)
+		os.Remove(thumbPath)
+	}
+	res, err := a.db.Exec(`UPDATE messages SET link_url=?, link_title=?, link_desc=?, thumb=COALESCE(?, thumb)
+		WHERE chat=? AND id=? AND link_title=''`, url, title, desc, nullBytes(thumb), chat, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 && title != "" {
+		a.touchMsg(chat, id)
+	}
+	return nil
+}
+
+func nullBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // setTranscript keeps a voice note's on-device transcript (made in Swift) in its extra

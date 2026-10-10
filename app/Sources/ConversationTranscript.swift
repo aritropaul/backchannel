@@ -363,6 +363,7 @@ extension ConversationViewController: NSTableViewDataSource, NSTableViewDelegate
             if let jid = chat?.jid { Transcripts.shared.shown(l.msg, in: jid) }
             fillWaveformIfNeeded(l.msg)
             requestThumbIfNeeded(l.msg)
+            previewLinkIfNeeded(l.msg)
             return v
         }
     }
