@@ -332,12 +332,41 @@ final class MessageLayout {
                 if v != nil { a.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: r) }
             }
         }
+        let mentions = msg.mentions.isEmpty ? MentionDirectory.shared.find(in: a.string) : msg.mentions
+        Self.markMentions(a, mentions, color: ink)
         if truncated {
             a.append(NSAttributedString(string: " Read More", attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                                                                             .foregroundColor: ink,
                                                                             .waLink: Self.readMoreURL]))
         }
         return a
+    }
+
+    static let mentionScheme = "backchannel-mention"
+
+    /// Every "@Name" a mention covers: semibold, coloured, and a link to that person's chat.
+    static func markMentions(_ a: NSMutableAttributedString, _ mentions: [(jid: String, name: String)], color: NSColor) {
+        for m in mentions.sorted(by: { $0.name.count > $1.name.count }) {
+            guard let url = URL(string: "\(mentionScheme):\(m.jid)") else { continue }
+            let ns = a.string as NSString
+            var from = 0
+            while from < ns.length {
+                let r = ns.range(of: "@" + m.name, range: NSRange(location: from, length: ns.length - from))
+                guard r.location != NSNotFound else { break }
+                // A whole name only ("@Priya" isn't the start of "@Priyanka"), and not one already marked.
+                if !MentionDirectory.endsWord(ns, at: NSMaxRange(r)) || a.attribute(.waLink, at: r.location, effectiveRange: nil) != nil {
+                    from = NSMaxRange(r)
+                    continue
+                }
+                a.enumerateAttribute(.font, in: r) { v, sub, _ in
+                    let size = (v as? NSFont)?.pointSize ?? Theme.body.pointSize
+                    a.addAttribute(.font, value: NSFont.systemFont(ofSize: size, weight: .semibold), range: sub)
+                }
+                a.addAttributes([.foregroundColor: color, .waLink: url], range: r)
+                a.removeAttribute(.underlineStyle, range: r)
+                from = r.location + r.length
+            }
+        }
     }
 
     private func bodyText() -> NSAttributedString {

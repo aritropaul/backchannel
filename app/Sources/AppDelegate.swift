@@ -387,6 +387,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 DispatchQueue.main.asyncAfter(deadline: .now() + 12) { QLPreviewPanel.shared()?.orderOut(nil) }
             }
         }
+        if let v = env["WA_MENTION_DEMO"] {
+            // Dev: the mention list with made-up people; nothing is sent, typing included.
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(v) ?? 2.5)) { [weak self] in self?.wc?.convo.devMentionDemo() }
+        }
+        if let v = env["WA_SHEET_DEMO"] {
+            // Dev: my own contact card, as a tapped mention shows it; put away 4 s later.
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(v) ?? 2.5)) { [weak self] in
+                guard let c = self?.wc?.convo, c.chat?.jid == Core.shared.me else { return }
+                c.showContactSheet(Core.shared.me)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { c.contactSheet?.dismiss() }
+            }
+        }
         if let secs = env["WA_SETTINGS_TONES"].flatMap(Double.init) {
             // Dev hook (with WA_SETTINGS_SECTION=notifications): opens the notification sound menu
             // for a screenshot and closes it after `secs`.

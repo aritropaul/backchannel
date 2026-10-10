@@ -487,6 +487,29 @@ final class Store {
         return out
     }
 
+    /// A group's members other than me, with the names this Mac knows them by, for @-mentions.
+    func mentionable(_ group: String) -> [(jid: String, name: String)] {
+        var jids: [String] = []
+        query("SELECT jid FROM members WHERE chat = ?", [group]) { jids.append($0.str(0)) }
+        let me = Core.shared.me
+        return jids.filter { $0 != me }.map { ($0, name($0)) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Every name a group's members (me included) might be @-mentioned by in older messages:
+    /// the name this Mac shows, and the saved and push names behind it.
+    func mentionNames(_ group: String) -> [(jid: String, name: String)] {
+        var jids: [String] = []
+        query("SELECT jid FROM members WHERE chat = ?", [group]) { jids.append($0.str(0)) }
+        if !jids.contains(Core.shared.me) { jids.append(Core.shared.me) }
+        var out: [(String, String)] = []
+        for j in jids {
+            let c = contactNames(j)
+            for n in Set([name(j), c.saved, c.push]) where !n.isEmpty && !n.hasPrefix("+") { out.append((j, n)) }
+        }
+        return out
+    }
+
     /// First few members' names, "You" last, the way WhatsApp lists them.
     func memberNames(_ group: String, limit: Int) -> [String] {
         var jids: [String] = []

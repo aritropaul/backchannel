@@ -196,14 +196,20 @@ func (a *App) applyContext(ci *waE2E.ContextInfo, r *msgRow) {
 		}
 	}
 	if r.Text != "" {
+		var ms []mention
 		for _, mj := range ci.GetMentionedJID() {
 			j, err := types.ParseJID(mj)
 			if err != nil {
 				continue
 			}
-			if name := a.nameFor(a.canon(j)); name != "" {
+			c := a.canon(j)
+			if name := a.nameFor(c); name != "" && strings.Contains(r.Text, "@"+j.User) {
 				r.Text = strings.ReplaceAll(r.Text, "@"+j.User, "@"+name)
+				ms = append(ms, mention{JID: c.String(), Name: name})
 			}
+		}
+		if len(ms) > 0 {
+			r.Extra = mentionsExtra(r.Extra, ms)
 		}
 	}
 }

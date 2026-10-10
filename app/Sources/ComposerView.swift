@@ -16,6 +16,22 @@ protocol ComposerDelegate: AnyObject {
     func composerAddAttachments(from anchor: NSView)
     func composerPasteImage(_ image: NSImage) -> Bool
     func composerPasteFiles(_ urls: [URL]) -> Bool
+    /// The "@name" being typed (nil when there isn't one), for the mention list.
+    func composerMentionQuery(_ query: String?)
+    /// ↑ ↓ Return Tab Esc while the mention list shows; true when the list used the key.
+    func composerMentionCommand(_ sel: Selector) -> Bool
+}
+
+extension NSAttributedString.Key {
+    /// A mention token in the composer: its value is the `MentionToken` it stands for.
+    static let waMention = NSAttributedString.Key("waMention")
+}
+
+/// Who a composer mention points at; the text carries it as "@" + name.
+final class MentionToken: NSObject {
+    let jid: String
+    let name: String
+    init(jid: String, name: String) { self.jid = jid; self.name = name }
 }
 
 struct LinkPreview {
@@ -461,6 +477,114 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     func focus() { window?.makeFirstResponder(textView) }
+
+    // MARK: mentions
+
+    /// The "@query" being typed, while the mention list is up for it.
+    private var mentionRange: NSRange?
+    /// Esc closed the list for the "@" at this location; it stays closed until another "@".
+    private var mentionDismissed: Int?
+    private var plainAttributes: [NSAttributedString.Key: Any] { [.font: Self.font, .foregroundColor: NSColor.labelColor] }
+
+    /// The glass field, which the mention list sits above.
+    var fieldView: NSView { field }
+
+    /// The people mentioned in the text, in order, as long as their "@Name" is intact.
+    var mentions: [(jid: String, name: String)] {
+        guard let s = textView.textStorage, s.length > 0 else { return [] }
+        var out: [(String, String)] = []
+        s.enumerateAttribute(.waMention, in: NSRange(location: 0, length: s.length)) { v, r, _ in
+            if let t = v as? MentionToken, (s.string as NSString).substring(with: r) == "@" + t.name { out.append((t.jid, t.name)) }
+        }
+        return out
+    }
+
+    /// Replaces the "@query" with "@Name " as one token.
+    func insertMention(jid: String, name: String) {
+        guard let r = mentionRange, let s = textView.textStorage, NSMaxRange(r) <= s.length else { return }
+        var attrs = plainAttributes
+        attrs[.font] = NSFont.systemFont(ofSize: Self.font.pointSize, weight: .semibold)
+        attrs[.foregroundColor] = NSColor.labelColor
+        attrs[.waMention] = MentionToken(jid: jid, name: name)
+        let token = NSMutableAttributedString(string: "@" + name, attributes: attrs)
+        token.append(NSAttributedString(string: " ", attributes: plainAttributes))
+        guard textView.shouldChangeText(in: r, replacementString: token.string) else { return }
+        s.replaceCharacters(in: r, with: token)
+        textView.typingAttributes = plainAttributes
+        textView.setSelectedRange(NSRange(location: r.location + token.length, length: 0))
+        mentionRange = nil
+        textView.didChangeText()
+    }
+
+    /// A token edited into something else becomes plain text again; typing right after
+    /// one doesn't join it.
+    private func repairMentions() {
+        guard let s = textView.textStorage, s.length > 0 else { return }
+        var broken: [(NSRange, MentionToken)] = []
+        s.enumerateAttribute(.waMention, in: NSRange(location: 0, length: s.length)) { v, r, _ in
+            if let t = v as? MentionToken, (s.string as NSString).substring(with: r) != "@" + t.name { broken.append((r, t)) }
+        }
+        guard !broken.isEmpty else { return }
+        s.beginEditing()
+        for (r, t) in broken {
+            let text = (s.string as NSString).substring(with: r)
+            s.removeAttribute(.waMention, range: r)
+            s.addAttributes(plainAttributes, range: r)
+            if text.hasPrefix("@" + t.name) {
+                let keep = NSRange(location: r.location, length: ("@" + t.name as NSString).length)
+                s.addAttributes([.waMention: t, .foregroundColor: NSColor.labelColor,
+                                 .font: NSFont.systemFont(ofSize: Self.font.pointSize, weight: .semibold)], range: keep)
+            }
+        }
+        s.endEditing()
+    }
+
+    /// Finds an "@" before the caret that starts a word, with at most two more words typed
+    /// after it, and tells the delegate what's been typed.
+    private func updateMentionQuery() {
+        var found: (NSRange, String)?
+        let sel = textView.selectedRange()
+        let ns = textView.string as NSString
+        if sel.length == 0, sel.location <= ns.length {
+            var i = sel.location - 1
+            while i >= 0, sel.location - i <= 40 {
+                let ch = ns.character(at: i)
+                if ch == 0x0A { break }
+                if ch == 0x40 {   // "@"
+                    let before = i == 0 ? " " : ns.substring(with: NSRange(location: i - 1, length: 1))
+                    let starts = before.rangeOfCharacter(from: .whitespacesAndNewlines) != nil || "([{\"'".contains(before)
+                    let inToken = textView.textStorage?.attribute(.waMention, at: i, effectiveRange: nil) != nil
+                    let query = ns.substring(with: NSRange(location: i + 1, length: sel.location - i - 1))
+                    if starts, !inToken, query.split(separator: " ", omittingEmptySubsequences: false).count <= 3,
+                       !query.hasPrefix(" ") {
+                        found = (NSRange(location: i, length: sel.location - i), query)
+                    }
+                    break
+                }
+                i -= 1
+            }
+        }
+        if let f = found, f.0.location == mentionDismissed { found = nil }
+        if found == nil, let d = mentionDismissed, d >= ns.length || ns.character(at: d) != 0x40 { mentionDismissed = nil }
+        mentionRange = found?.0
+        delegate?.composerMentionQuery(found?.1)
+    }
+
+    func textView(_ textView: NSTextView, shouldSetSpellingState value: Int, range: NSRange) -> Int {
+        guard value != 0, let s = textView.textStorage, NSMaxRange(range) <= s.length else { return value }
+        var inToken = false
+        s.enumerateAttribute(.waMention, in: range) { v, _, stop in if v != nil { inToken = true; stop.pointee = true } }
+        return inToken ? 0 : value
+    }
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        let sel = textView.selectedRange()
+        if sel.location > 0, sel.location <= (textView.textStorage?.length ?? 0),
+           textView.textStorage?.attribute(.waMention, at: sel.location - 1, effectiveRange: nil) != nil {
+            textView.typingAttributes = plainAttributes
+        }
+        updateMentionQuery()
+    }
     /// The + button, which the attach menu opens above.
     var attachAnchor: NSView { plusButton }
     /// Puts an emoji at the insertion point, as if typed.
@@ -555,14 +679,23 @@ final class ComposerView: NSView, NSTextViewDelegate {
         }
         textView.needsDisplay = true
         scheduleLinkCheck()
+        updateMentionQuery()
     }
 
     func textDidChange(_ notification: Notification) {
+        repairMentions()
         textChanged()
         if !textView.string.isEmpty { delegate?.composerDidType() }
     }
 
     func textView(_ textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if let r = mentionRange, delegate?.composerMentionCommand(sel) == true {
+            if sel == #selector(NSResponder.cancelOperation(_:)) {
+                mentionDismissed = r.location
+                mentionRange = nil
+            }
+            return true
+        }
         if sel == #selector(NSResponder.insertNewline(_:)) {
             let flags = NSApp.currentEvent?.modifierFlags ?? []
             // "Enter is send" (Settings › Chats): Return sends, Shift/Option-Return breaks the line.

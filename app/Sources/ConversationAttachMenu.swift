@@ -293,6 +293,23 @@ extension ConversationViewController {
         }
     }
 
+    /// A mention in a bubble: that person's card (ContactSheet).
+    func openMention(_ jid: String) {
+        guard !jid.isEmpty else { return }
+        showContactSheet(jid)
+    }
+
+    /// The card's Message and Contact Info: that person's chat, and its info panel.
+    func openPerson(_ jid: String, info: Bool) {
+        if store.chat(jid) != nil { onOpenChat?(jid) } else { openChat(jid: jid) }
+        guard info else { return }
+        // Once the chat is open, its info panel slides in.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, self.chat?.jid == jid else { return }
+            self.onProfile?()
+        }
+    }
+
     private func openChat(jid: String) {
         Task { @MainActor [weak self] in
             let r = await Core.shared.callAsync("resolve", ["phone": JID.user(jid)])

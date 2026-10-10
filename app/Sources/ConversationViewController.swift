@@ -166,6 +166,12 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     let scrollView = NSScrollView()
     let tableView = NSTableView()
     let composer = ComposerView()
+    /// The @-mention list above the composer, in groups.
+    let mentionPicker = MentionPicker()
+    /// The card a tapped mention opens.
+    var contactSheet: ContactSheet?
+    /// The open group's members, for mentions; loaded when "@" is first typed.
+    var mentionPeople: [MentionCandidate]?
     let jumpButton = NSButton()
     private let emptyLabel = NSTextField(labelWithString: "")
 
@@ -232,7 +238,11 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
 
         capsule.onClick = { [weak self] in self?.onProfile?() }
         capsule.isHidden = true
-        [scrollView, topBlur, emptyLabel, composer, jumpButton, capsule].forEach(view.addSubview)
+        mentionPicker.onPick = { [weak self] p in
+            self?.composer.insertMention(jid: p.jid, name: p.name)
+            self?.mentionPicker.hide()
+        }
+        [scrollView, topBlur, emptyLabel, composer, jumpButton, capsule, mentionPicker].forEach(view.addSubview)
         // The transcript lives in the safe area; the root view's canvas runs under the sidebar.
         let safe = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -255,6 +265,9 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
             capsule.centerXAnchor.constraint(equalTo: safe.centerXAnchor),
             jumpButton.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -22),
             jumpButton.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -12),
+            mentionPicker.leadingAnchor.constraint(equalTo: composer.fieldView.leadingAnchor),
+            mentionPicker.trailingAnchor.constraint(lessThanOrEqualTo: composer.fieldView.trailingAnchor),
+            mentionPicker.bottomAnchor.constraint(equalTo: composer.fieldView.topAnchor, constant: -8),
         ])
 
         AudioPlayback.shared.onTick = { [weak self] id in self?.redraw(id: id) }
@@ -321,6 +334,11 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
         layouts = [:]
         composer.hideReply(animated: false)
         clearAttachments(animated: false)
+        mentionPicker.hide()
+        mentionPeople = nil
+        contactSheet?.removeFromSuperview()
+        contactSheet = nil
+        MentionDirectory.shared.set(c?.isGroup == true ? store.mentionNames(c!.jid) : [])
         guard let c else {
             msgs = []
             rows = [.spacer]

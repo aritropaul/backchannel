@@ -141,6 +141,17 @@ struct Message: Sendable, Equatable {
         return (o["pages"] as? NSNumber)?.intValue ?? 0
     }
 
+    /// The @-mentions in the text, from the core's extra JSON: who, and the name the text shows.
+    var mentions: [(jid: String, name: String)] {
+        guard extra.contains("\"mentions\""), let d = extra.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let ms = o["mentions"] as? [[String: Any]] else { return [] }
+        return ms.compactMap { m in
+            guard let j = m["jid"] as? String, let n = m["name"] as? String, !n.isEmpty else { return nil }
+            return (j, n)
+        }
+    }
+
     var date: Date { Date(timeIntervalSince1970: TimeInterval(ts) / 1000) }
     var isQuoteFromMe: Bool { !quoteSender.isEmpty && quoteSender == Core.shared.me }
 }

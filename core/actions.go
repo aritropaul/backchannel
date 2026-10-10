@@ -61,6 +61,13 @@ type req struct {
 	Gif         bool         `json:"gif"`        // send_file: a looping, silent GIF
 	Retry       bool         `json:"retry"`      // download: ask the phone to re-upload expired media
 	GifSource   string       `json:"gif_source"` // send_file: "giphy" or "tenor", credited on the GIF
+	Mentions    []mention    `json:"mentions"`   // send_text: the people @-mentioned in Text
+}
+
+// mention is one @-mention: Text carries it as "@" + Name, the wire as "@" + the user part.
+type mention struct {
+	JID  string `json:"jid"`
+	Name string `json:"name"`
 }
 
 func call(raw []byte) (out any) {
@@ -276,12 +283,28 @@ func (a *App) sendText(q req) (any, error) {
 	}
 	msg := &waE2E.Message{}
 	ci := a.quoteContext(chat, quote)
+	// @-mentions: the text shows "@Name"; WhatsApp wants "@<number>" plus the JIDs.
+	wire, mentioned := text, []string{}
+	for _, m := range q.Mentions {
+		j, err := types.ParseJID(m.JID)
+		if err != nil || m.Name == "" || !strings.Contains(wire, "@"+m.Name) {
+			continue
+		}
+		wire = strings.Replace(wire, "@"+m.Name, "@"+j.User, 1)
+		mentioned = append(mentioned, j.String())
+	}
+	if len(mentioned) > 0 {
+		if ci == nil {
+			ci = &waE2E.ContextInfo{}
+		}
+		ci.MentionedJID = mentioned
+	}
 	var thumb []byte
 	if q.Thumb != "" {
 		thumb, _ = os.ReadFile(q.Thumb)
 	}
 	if ci != nil || q.LinkTitle != "" {
-		ext := &waE2E.ExtendedTextMessage{Text: proto.String(text), ContextInfo: ci}
+		ext := &waE2E.ExtendedTextMessage{Text: proto.String(wire), ContextInfo: ci}
 		if q.LinkTitle != "" {
 			ext.MatchedText = proto.String(q.LinkURL)
 			ext.Title = proto.String(q.LinkTitle)
@@ -303,17 +326,51 @@ func (a *App) sendText(q req) (any, error) {
 	if q.LinkTitle != "" {
 		r.Thumb = thumb
 	}
-	if ci != nil {
+	if quote != "" && ci.GetStanzaID() != "" {
 		r.QuoteID, r.QuoteSender = quote, ci.GetParticipant()
 		var q msgRow
 		a.rdb.QueryRow(`SELECT text, kind FROM messages WHERE chat=? AND id=?`, chat.String(), quote).Scan(&q.Text, &q.Kind)
 		r.QuoteText, r.QuoteKind = q.Text, q.Kind
 	}
+	if len(mentioned) > 0 {
+		r.Extra = mentionsExtra(r.Extra, q.Mentions)
+	}
 	a.localEcho(r, chat)
-	go a.deliver(chat, id, msg)
+	go func() {
+		if len(mentioned) > 0 && chat.Server == types.GroupServer {
+			a.lidMentions(chat, msg.ExtendedTextMessage)
+		}
+		a.deliver(chat, id, msg)
+	}()
 	return map[string]any{"id": id}, nil
 }
 
+// lidMentions rewrites phone-number mentions as LIDs in a group that addresses its
+// members by LID, the way the phone does there.
+func (a *App) lidMentions(chat types.JID, ext *waE2E.ExtendedTextMessage) {
+	g, err := a.cli.GetGroupInfo(a.ctx, chat)
+	if err != nil || g.AddressingMode != types.AddressingModeLID || ext == nil || a.cli.Store.LIDs == nil {
+		return
+	}
+	text, ci := ext.GetText(), ext.GetContextInfo()
+	for i, s := range ci.GetMentionedJID() {
+		j, err := types.ParseJID(s)
+		if err != nil || j.Server != types.DefaultUserServer {
+			continue
+		}
+		lid, err := a.cli.Store.LIDs.GetLIDForPN(a.ctx, j)
+		if err != nil || lid.IsEmpty() {
+			continue
+		}
+		text = strings.Replace(text, "@"+j.User, "@"+lid.User, 1)
+		ci.MentionedJID[i] = lid.String()
+	}
+	ext.Text = proto.String(text)
+}
+
+// mentionsExtra adds the @-mentions (JID and the name shown) to a row's extra JSON,
+// so the bubble can mark them and open the person's chat.
+func mentionsExtra(extra string, ms []mention) string { return mergeExtra(extra, "mentions", ms) }
 
 // mergeExtra sets one key in a row's extra JSON object, leaving the rest alone.
 func mergeExtra(extra, key string, v any) string {

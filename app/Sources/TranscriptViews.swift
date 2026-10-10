@@ -452,7 +452,12 @@ final class BubbleView: NSView {
             return
         }
         switch item.hit(p) {
-        case .link(let url): NSWorkspace.shared.open(url)
+        case .link(let url):
+            if url.scheme == MessageLayout.mentionScheme {
+                controller?.openMention(String(url.absoluteString.dropFirst(MessageLayout.mentionScheme.count + 1)))
+            } else {
+                NSWorkspace.shared.open(url)
+            }
         case .readMore: controller?.expand(item.msg)
         case .media, .file: controller?.open(media: item.msg)
         case .quote: controller?.jump(to: item.msg.quoteID)
