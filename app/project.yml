@@ -36,6 +36,9 @@ targets:
       - path: Icon/Backchannel.icon
         type: file
         buildPhase: resources
+      # Notification tones, made by tools/sounds/tones.py (Tones.swift).
+      - path: Sounds
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aritropaul.backchannel

@@ -52,8 +52,8 @@ enum Prefs {
         }
         NotificationCenter.default.post(name: changed, object: nil)
     }
-    /// default | none | a macOS alert sound name
-    static var notifySound: String { string("WA.notify.sound", "default") }
+    /// A tone's name (Tones), "default" (the macOS alert sound) or "none".
+    static var notifySound: String { string("WA.notify.sound", Tones.standard) }
     static var badge: Bool { bool("WA.badge", true) }
 
     static func applyTheme() {

@@ -216,16 +216,9 @@ extension ProfileViewController {
             if !until.isEmpty { page.add(ProfilePage.note(until)) }
 
             page.add(ProfilePage.note("SOUND", size: 11, weight: .semibold))
-            let popup = NSPopUpButton()
+            let popup = Tones.popup(selected: ChatPrefs.sound(jid),
+                                    leading: [("", "Same as Settings (\(Tones.title(Prefs.notifySound)))")])
             popup.controlSize = .small
-            let current = ChatPrefs.sound(jid)
-            let global = Prefs.notifySound == "default" ? "Default" : Prefs.notifySound == "none" ? "None" : Prefs.notifySound
-            let options = [("", "Same as Settings (\(global))"), ("default", "Default"), ("none", "None")] + Prefs.alertSounds.map { ($0, $0) }
-            for (v, t) in options {
-                popup.addItem(withTitle: t)
-                popup.lastItem?.representedObject = v
-                if v == current { popup.select(popup.lastItem) }
-            }
             popup.target = SoundPicker.shared
             popup.action = #selector(SoundPicker.picked(_:))
             SoundPicker.shared.jid = jid
@@ -725,7 +718,7 @@ final class SoundPicker: NSObject {
     @objc func picked(_ sender: NSPopUpButton) {
         let v = sender.selectedItem?.representedObject as? String ?? ""
         ChatPrefs.setSound(jid, v)
-        if !v.isEmpty, v != "none", v != "default" { NSSound(named: NSSound.Name(v))?.play() }
+        Tones.preview(v.isEmpty ? Prefs.notifySound : v)
     }
 }
 

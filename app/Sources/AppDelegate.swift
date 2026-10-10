@@ -371,6 +371,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 if let s = env["WA_SETTINGS_SECTION"].flatMap(SettingsSection.init) { self?.settings?.show(s) }
             }
         }
+        if let secs = env["WA_SETTINGS_TONES"].flatMap(Double.init) {
+            // Dev hook (with WA_SETTINGS_SECTION=notifications): opens the notification sound menu
+            // for a screenshot and closes it after `secs`.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                @MainActor func find(_ v: NSView) -> NSPopUpButton? {
+                    if let p = v as? NSPopUpButton, p.itemArray.contains(where: { $0.representedObject as? String == Tones.standard }) { return p }
+                    return v.subviews.lazy.compactMap(find).first
+                }
+                guard let view = self?.settings?.window?.contentView, let popup = find(view), let menu = popup.menu else { return }
+                menu.perform(#selector(NSMenu.cancelTracking), with: nil, afterDelay: secs, inModes: [.common])
+                popup.performClick(nil)
+            }
+        }
         if env["WA_TEST_NOTIFY"] != nil {
             // Verifies notifications end to end: logs the permission, posts one, then logs what macOS delivered.
             Task {
@@ -474,13 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         content.threadIdentifier = locked ? "locked" : chat
         content.userInfo = ["chat": locked ? "" : chat]
         let chatSound = ChatPrefs.sound(chat)
-        switch chatSound.isEmpty ? Prefs.notifySound : chatSound {
-        case "default": content.sound = .default
-        case "none": content.sound = nil
-        case let name:
-            content.sound = nil
-            NSSound(named: NSSound.Name(name))?.play()
-        }
+        content.sound = Tones.chime(chatSound.isEmpty ? Prefs.notifySound : chatSound)
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }

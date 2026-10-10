@@ -335,7 +335,13 @@ import UserNotifications
 
     private func notifications() -> [NSView] {
         let permission = NotificationPermissionRow()
-        let sounds = [("default", "Default"), ("none", "None")] + Prefs.alertSounds.map { ($0, $0) }
+        let tone = Tones.popup(selected: Prefs.notifySound)
+        let toneRow = FormRow(title: "Notification sound", detail: nil, accessory: tone)
+        toneRow.bind(tone) {
+            guard let v = tone.selectedItem?.representedObject as? String else { return }
+            Prefs.set("WA.notify.sound", v)
+            Tones.preview(v)
+        }
         return [
             Form.group([permission]),
             Form.group([
@@ -350,10 +356,7 @@ import UserNotifications
                 Form.toggle("Reaction notifications", on: Prefs.notifyGroupReactions) { on in Prefs.set("WA.notify.groupReactions", on) },
             ], header: "Groups", footer: "Muted chats never notify."),
             Form.group([
-                Form.popup("Notification sound", options: sounds, selected: Prefs.notifySound) { v in
-                    Prefs.set("WA.notify.sound", v)
-                    if v != "default" && v != "none" { NSSound(named: NSSound.Name(v))?.play() }
-                },
+                toneRow,
                 Form.toggle("Play sound for outgoing messages", on: Prefs.outgoingSound) { on in Prefs.set("WA.sound.outgoing", on) },
                 Form.toggle("Unread count on the Dock icon", on: Prefs.badge) { on in Prefs.set("WA.badge", on) },
             ], header: "Sounds and badges"),

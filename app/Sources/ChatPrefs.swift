@@ -33,7 +33,7 @@ enum ChatPrefs {
 
     // MARK: Notification sound
 
-    /// "" follows Settings › Notifications; otherwise "none" or a macOS alert sound.
+    /// "" follows Settings › Notifications; otherwise a tone's name, "default" or "none" (Tones).
     static func sound(_ jid: String) -> String { UserDefaults.standard.string(forKey: "WA.chatSound." + jid) ?? "" }
     static func setSound(_ jid: String, _ v: String) {
         UserDefaults.standard.set(v.isEmpty ? nil : v, forKey: "WA.chatSound." + jid)
