@@ -74,6 +74,8 @@ type App struct {
 	backfilled      sync.Map // chat -> struct{}: missing previews/waveforms already re-requested
 	backfillPending sync.Map // chats opened before we were connected
 	thumbAsked      sync.Map // chat/id -> thumbnail download attempted this session
+	editsMu         sync.Mutex
+	editsSince      int64 // ms: edits have landed as they arrive since then (resyncEdits)
 	synced          atomic.Bool
 
 	statMsgs  atomic.Int64 // messages written
@@ -115,6 +117,10 @@ func start(dir string) (string, error) {
 		avatarQ:  make(chan string, 4096),
 	}
 	a.activeChat.Store("")
+	// Before this build the newer encrypted edits were dropped as they arrived;
+	// from its first run on they land. Older ones come back through resyncEdits.
+	db.Exec(`INSERT INTO kv (k, v) VALUES ('edits_live_since', ?) ON CONFLICT(k) DO NOTHING`, fmt.Sprint(time.Now().UnixMilli()))
+	db.QueryRow(`SELECT v FROM kv WHERE k='edits_live_since'`).Scan(&a.editsSince)
 	a.pend.msgs = map[string]map[string]struct{}{}
 	a.pend.reload = map[string]struct{}{}
 	app = a

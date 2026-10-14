@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // mediaRef is everything needed to download an attachment later without
@@ -177,6 +179,39 @@ func (a *App) content(m *waE2E.Message, r *msgRow) bool {
 		a.applyContext(ci, r)
 	}
 	return true
+}
+
+// editContent unwraps an edit to its new content: the EditedMessage wrapper,
+// then the MESSAGE_EDIT protocol message inside it. An encrypted edit decrypts
+// to the whole edit, not the new text. Anything else comes back as it is.
+func editContent(m *waE2E.Message) *waE2E.Message {
+	if inner := m.GetEditedMessage().GetMessage(); inner != nil {
+		m = inner
+	}
+	if pm := m.GetProtocolMessage(); pm.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && pm.GetEditedMessage() != nil {
+		return pm.GetEditedMessage()
+	}
+	return m
+}
+
+// fieldNames lists the fields set on a message, for logs: its shape, never its content.
+func fieldNames(m *waE2E.Message) string {
+	var names []string
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+	return strings.Join(names, ",")
+}
+
+// landed reports whether an UPDATE changed a row: an edit whose message isn't
+// here changes nothing, and would otherwise vanish without a trace.
+func landed(res sql.Result, err error) bool {
+	if err != nil || res == nil {
+		return false
+	}
+	n, err := res.RowsAffected()
+	return err == nil && n > 0
 }
 
 // applyContext pulls reply-quote and @mention info out of ContextInfo.

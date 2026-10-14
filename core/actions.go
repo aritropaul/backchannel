@@ -168,6 +168,8 @@ func call(raw []byte) (out any) {
 		a.requestAvatar(r.Chat)
 	case "older":
 		go a.requestOlder(r.Chat)
+	case "resync_edits":
+		go a.resyncEdits(r.Chat, r.ID)
 	case "subscribe":
 		go a.subscribe(r.Chat)
 	case "pair_phone":
@@ -1082,6 +1084,7 @@ func (a *App) backfill(chatS string) {
 		a.backfillPending.Store(chatS, true)
 		return
 	}
+	defer a.resyncEdits(chatS, "")
 	rows, err := a.rdb.Query(`SELECT ts FROM messages WHERE chat=? AND
 		((kind=? AND link_title='' AND (text LIKE '%http://%' OR text LIKE '%https://%')) OR (kind=? AND waveform IS NULL))
 		ORDER BY ts DESC LIMIT 300`, chatS, KText, KVoice)
@@ -1134,6 +1137,89 @@ func (a *App) backfill(chatS string) {
 		a.db.Exec(`INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, key, itoa(int(time.Now().Unix())))
 		a.log.Infof("backfill %s: requested 50 before %s", chatS, id)
 		time.Sleep(time.Second)
+	}
+}
+
+// resyncEdits asks the phone to resend part of a chat so edits that never landed
+// here change their messages: resent history carries each edit onto the message
+// it edits (importConversation). Builds before 0.5.1 dropped the newer encrypted
+// edits as they arrived. With no `before` it covers the newest message and the 100
+// before it, once per chat ever (on open); otherwise the 100 before that message
+// (paging back). Each
+// stretch of 50 is asked for once ever, and none whose messages all came after
+// editsSince, whose edits landed as they arrived.
+func (a *App) resyncEdits(chatS, before string) {
+	chat, err := parseChat(chatS)
+	if err != nil || a.ready() != nil {
+		return
+	}
+	a.editsMu.Lock()
+	defer a.editsMu.Unlock()
+	type anchor struct {
+		id, sender string
+		fromMe     int
+		ts         int64
+	}
+	const cols = `SELECT id, sender, from_me, ts FROM messages WHERE chat=? AND kind != ?`
+	load := func(q string, args ...any) (anchor, bool) {
+		var x anchor
+		return x, a.rdb.QueryRow(cols+q, append([]any{chatS, KPending}, args...)...).Scan(&x.id, &x.sender, &x.fromMe, &x.ts) == nil
+	}
+	var at anchor
+	var ok bool
+	if before == "" {
+		var v string
+		if a.rdb.QueryRow(`SELECT v FROM kv WHERE k=?`, "edits_open:"+chatS).Scan(&v) == nil {
+			return
+		}
+		a.db.Exec(`INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, "edits_open:"+chatS, itoa(int(time.Now().Unix())))
+		at, ok = load(` ORDER BY ts DESC LIMIT 1`)
+		if ok && at.ts < a.editsSince {
+			// The newest message is in no stretch (the phone sends what comes
+			// before an anchor). Anchored on an ID the phone doesn't have,
+			// timestamped now, the phone sends the latest few instead, edits
+			// in their edit form.
+			latest := &types.MessageInfo{
+				MessageSource: types.MessageSource{Chat: chat, Sender: a.me(), IsFromMe: true, IsGroup: chat.Server == types.GroupServer},
+				ID:            a.cli.GenerateMessageID(),
+				Timestamp:     time.Now(),
+			}
+			if _, err := a.cli.SendPeerMessage(a.ctx, a.cli.BuildHistorySyncRequest(latest, 5)); err != nil {
+				a.log.Errorf("edits %s: latest: %v", chatS, err)
+			} else {
+				a.log.Infof("edits %s: requested the latest 5", chatS)
+			}
+		}
+	} else {
+		at, ok = load(` AND id=?`, before)
+	}
+	for i := 0; ok && i < 2; i++ {
+		// The phone answers with the 50 messages before the anchor; the next
+		// stretch ends where this one starts.
+		oldest, has := load(` AND ts < ? ORDER BY ts DESC LIMIT 1 OFFSET 49`, at.ts)
+		if !has {
+			if oldest, has = load(` AND ts < ? ORDER BY ts ASC LIMIT 1`, at.ts); !has {
+				return // nothing before the anchor
+			}
+		}
+		key := "edits:" + chatS + ":" + at.id
+		var v string
+		if oldest.ts < a.editsSince && a.rdb.QueryRow(`SELECT v FROM kv WHERE k=?`, key).Scan(&v) != nil {
+			sj, _ := types.ParseJID(at.sender)
+			info := &types.MessageInfo{
+				MessageSource: types.MessageSource{Chat: chat, Sender: sj, IsFromMe: at.fromMe == 1, IsGroup: chat.Server == types.GroupServer},
+				ID:            at.id,
+				Timestamp:     time.UnixMilli(at.ts),
+			}
+			if _, err := a.cli.SendPeerMessage(a.ctx, a.cli.BuildHistorySyncRequest(info, 50)); err != nil {
+				a.log.Errorf("edits %s: %v", chatS, err)
+				return
+			}
+			a.db.Exec(`INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, key, itoa(int(time.Now().Unix())))
+			a.log.Infof("edits %s: requested 50 before %s", chatS, at.id)
+			time.Sleep(time.Second)
+		}
+		at = oldest
 	}
 }
 

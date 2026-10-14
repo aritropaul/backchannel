@@ -273,6 +273,8 @@ extension ConversationViewController: NSTableViewDataSource, NSTableViewDelegate
             if !older.isEmpty {
                 msgs.insert(contentsOf: older, at: 0)
                 rebuildAndReload(.anchor)
+                // Edits that never landed here come back with the phone's copy of these.
+                Core.shared.call("resync_edits", ["chat": c.jid, "id": first.id])
                 return
             }
         }

@@ -295,35 +295,54 @@ func (a *App) onEventResponse(e *events.Message, r *msgRow) {
 // onSecretEdit applies an encrypted edit: an event changed or cancelled, a poll
 // edited, or a message edited the newer way.
 func (a *App) onSecretEdit(e *events.Message, r *msgRow) {
+	target, _, ok := a.applySecretEdit(a.db, e, r)
+	if target == "" {
+		return
+	}
+	a.logEdit(r.Chat, target, ok)
+	a.touchMsg(r.Chat, target)
+}
+
+// applySecretEdit decrypts an encrypted edit and applies it to the message it
+// edits. It returns that message's ID ("" when the edit couldn't be read), a
+// message edit's new content on that ID, and whether a stored message took it.
+// History sync carries these too.
+func (a *App) applySecretEdit(x execer, e *events.Message, r *msgRow) (string, *msgRow, bool) {
 	sm := e.Message.GetSecretEncryptedMessage()
 	target := sm.GetTargetMessageKey().GetID()
 	dec, err := a.cli.DecryptSecretEncryptedMessage(a.ctx, e)
 	if err != nil {
 		a.log.Warnf("secret edit %s on %s: %v", r.ID, target, err)
-		return
+		return "", nil, false
 	}
+	dec = editContent(dec)
 	switch {
 	case dec.GetEventMessage() != nil:
 		ev := dec.GetEventMessage()
-		a.db.Exec(`UPDATE messages SET text=?, extra=?, edited=1 WHERE chat=? AND id=? AND kind=?`,
-			ev.GetName(), jsonString(eventFrom(ev)), r.Chat, target, KEvent)
+		return target, nil, landed(x.Exec(`UPDATE messages SET text=?, extra=?, edited=1 WHERE chat=? AND id=? AND kind=?`,
+			ev.GetName(), jsonString(eventFrom(ev)), r.Chat, target, KEvent))
 	case pollCreation(dec) != nil:
 		p := pollCreation(dec)
 		opts := make([]string, 0, len(p.GetOptions()))
 		for _, o := range p.GetOptions() {
 			opts = append(opts, o.GetOptionName())
 		}
-		if len(opts) > 0 {
-			a.db.Exec(`UPDATE messages SET text=?, extra=?, edited=1 WHERE chat=? AND id=? AND kind=?`,
-				p.GetName(), jsonString(pollExtra{Options: opts, Multi: p.GetSelectableOptionsCount() != 1}), r.Chat, target, KPoll)
+		if len(opts) == 0 {
+			return "", nil, false
 		}
+		return target, nil, landed(x.Exec(`UPDATE messages SET text=?, extra=?, edited=1 WHERE chat=? AND id=? AND kind=?`,
+			p.GetName(), jsonString(pollExtra{Options: opts, Multi: p.GetSelectableOptionsCount() != 1}), r.Chat, target, KPoll))
 	default:
-		var nr msgRow
-		if a.content(dec, &nr) && nr.Text != "" {
-			a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`, nr.Text, r.Chat, target, KRevoked)
+		// Only the sender edits, so the edit's sender is the message's.
+		nr := *r
+		nr.ID = target
+		if !a.content(dec, &nr) || nr.Text == "" {
+			a.log.Warnf("secret edit %s on %s: nothing to show in %s", r.ID, target, fieldNames(dec))
+			return "", nil, false
 		}
+		return target, &nr, landed(x.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`,
+			nr.Text, r.Chat, target, KRevoked))
 	}
-	a.touchMsg(r.Chat, target)
 }
 
 // importInteractions stores the votes and responses history sync carries on a

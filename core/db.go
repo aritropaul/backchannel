@@ -354,8 +354,15 @@ type msgRow struct {
 	Extra                      string // JSON, per kind
 }
 
+// editableKinds are the kinds whose text can be edited: text and captions.
+var editableKinds = fmt.Sprintf("%d,%d,%d,%d", KText, KImage, KVideo, KDocument)
+
 // upsertMessage inserts or refreshes a message. Status only ever moves forward,
-// a downloaded media_path is kept, and a revoked message stays revoked.
+// a downloaded media_path is kept, and a revoked message stays revoked. A message
+// the phone resends with other text than we have was edited (a message's text
+// changes no other way, and a resend carries no edit of its own); text with an @
+// is left alone, since a mention's name can read differently from one store to
+// the next.
 func upsertMessage(x execer, m *msgRow) error {
 	_, err := x.Exec(`INSERT INTO messages
 		(chat, id, sender, push_name, from_me, ts, kind, text, status, quote_id, quote_sender, quote_text, quote_kind,
@@ -366,6 +373,11 @@ func upsertMessage(x execer, m *msgRow) error {
 			push_name=CASE WHEN excluded.push_name != '' THEN excluded.push_name ELSE messages.push_name END,
 			kind=CASE WHEN messages.kind = 10 THEN 10 ELSE excluded.kind END,
 			text=CASE WHEN messages.kind = 10 OR messages.edited = 1 THEN messages.text ELSE excluded.text END,
+			edited=CASE WHEN messages.edited = 1 THEN 1
+				WHEN messages.kind = excluded.kind AND messages.kind IN (`+editableKinds+`)
+					AND messages.text != '' AND excluded.text != '' AND messages.text != excluded.text
+					AND instr(messages.text, '@') = 0 AND instr(excluded.text, '@') = 0 THEN 1
+				ELSE 0 END,
 			status=MAX(messages.status, excluded.status),
 			quote_id=excluded.quote_id, quote_sender=excluded.quote_sender,
 			quote_text=excluded.quote_text, quote_kind=excluded.quote_kind,

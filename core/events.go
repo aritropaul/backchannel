@@ -261,10 +261,13 @@ func (a *App) onMessage(e *events.Message, live bool) {
 			a.touchMsg(r.Chat, target)
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
 			var nr msgRow
-			if a.content(pm.GetEditedMessage(), &nr) {
-				a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`, nr.Text, r.Chat, target, KRevoked)
-				a.touchMsg(r.Chat, target)
+			if !a.content(pm.GetEditedMessage(), &nr) {
+				a.log.Warnf("edit %s/%s: nothing to show in %s", r.Chat, target, fieldNames(pm.GetEditedMessage()))
+				break
 			}
+			a.logEdit(r.Chat, target, landed(a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=? AND kind != ?`,
+				nr.Text, r.Chat, target, KRevoked)))
+			a.touchMsg(r.Chat, target)
 		case waE2E.ProtocolMessage_EPHEMERAL_SETTING:
 			a.setChatField(chat, "ephemeral", int(pm.GetEphemeralExpiration()))
 		case waE2E.ProtocolMessage_LIMIT_SHARING:
@@ -293,9 +296,19 @@ func (a *App) onMessage(e *events.Message, live bool) {
 	}
 	if e.IsEdit {
 		// History sync delivers edits already unwrapped onto the original ID.
-		var nr msgRow
+		nr := *r
 		if a.content(m, &nr) {
-			a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, nr.Text, r.Chat, r.ID)
+			if landed(a.db.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, nr.Text, r.Chat, r.ID)) {
+				a.logEdit(r.Chat, r.ID, true)
+			} else if editTarget(e.RawMessage) == r.ID {
+				// The message itself never got here: this is it, edited.
+				if r.FromMe {
+					nr.Status = StSent
+				}
+				if addEdited(a.db, &nr, chat.Server == types.GroupServer) {
+					a.log.Infof("edit %s/%s: message added", r.Chat, r.ID)
+				}
+			}
 			a.touchMsg(r.Chat, r.ID)
 		}
 		return
@@ -608,6 +621,16 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 
 	msgs := conv.GetMessages() // newest first
 	var thumbs []string        // re-sent photos/videos whose thumbnail is a separate download
+	type secretEdit struct {
+		evt *events.Message
+		r   *msgRow
+	}
+	type edit struct {
+		row   *msgRow // the new content on the edited message's ID
+		named bool    // the edit names that ID (editTarget), so a missing message can be stored
+	}
+	var edits []edit
+	var secretEdits []secretEdit
 	for i := len(msgs) - 1; i >= 0; i-- {
 		wm := msgs[i].GetMessage()
 		if wm == nil || wm.GetMessage() == nil {
@@ -632,10 +655,17 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		if rm := m.GetReactionMessage(); rm != nil {
 			continue // reactions in history arrive on the target message itself
 		}
+		if r.FromMe {
+			r.Status = webStatus(wm.GetStatus())
+		}
+		if m.GetSecretEncryptedMessage() != nil {
+			secretEdits = append(secretEdits, secretEdit{evt, r})
+			continue
+		}
 		if evt.IsEdit || isEditProto(evt.RawMessage) {
-			var nr msgRow
+			nr := *r
 			if a.content(m, &nr) {
-				tx.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, nr.Text, r.Chat, r.ID)
+				edits = append(edits, edit{&nr, editTarget(evt.RawMessage) == r.ID})
 			}
 			continue
 		}
@@ -643,9 +673,6 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 			r.Kind = KRevoked
 		} else if !a.content(m, r) {
 			continue
-		}
-		if r.FromMe {
-			r.Status = webStatus(wm.GetStatus())
 		}
 		r.Starred = wm.GetStarred()
 		if err := upsertMessage(tx, r); err != nil {
@@ -670,6 +697,27 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 		a.importInteractions(tx, r, wm.GetPollUpdates(), wm.GetEventResponses())
 		bumpChat(tx, r.Chat, isGroup, r.TS, r.ID)
 	}
+	// Edits go on after the batch's messages, wherever the phone put them in it.
+	// History can carry an edited message as nothing but its edit, so one whose
+	// message isn't here is that message: it's stored, marked edited.
+	applied, added := 0, 0
+	for _, e := range edits {
+		if landed(tx.Exec(`UPDATE messages SET text=?, edited=1 WHERE chat=? AND id=?`, e.row.Text, e.row.Chat, e.row.ID)) {
+			applied++
+		} else if e.named && addEdited(tx, e.row, isGroup) {
+			added++
+		}
+	}
+	for _, se := range secretEdits {
+		if _, nr, ok := a.applySecretEdit(tx, se.evt, se.r); ok {
+			applied++
+		} else if nr != nil && addEdited(tx, nr, isGroup) {
+			added++
+		}
+	}
+	if applied+added > 0 {
+		a.log.Infof("history %s: %d edits applied, %d edited messages added", chat, applied, added)
+	}
 	if err := tx.Commit(); err != nil {
 		a.log.Errorf("history commit %s: %v", chat, err)
 		return
@@ -687,6 +735,35 @@ func (a *App) importConversation(conv *waHistorySync.Conversation, typ waHistory
 	} else {
 		a.touchChats()
 	}
+}
+
+// logEdit notes where a live edit went: one that finds no message is otherwise lost without a trace.
+func (a *App) logEdit(chat, id string, ok bool) {
+	if ok {
+		a.log.Infof("edit %s/%s: applied", chat, id)
+	} else {
+		a.log.Warnf("edit %s/%s: no such message", chat, id)
+	}
+}
+
+// editTarget is the ID of the message an edit names in its MESSAGE_EDIT protocol
+// message, under whatever wrappers it came in ("" when it names none).
+func editTarget(raw *waE2E.Message) string {
+	probe := (&events.Message{RawMessage: raw}).UnwrapRaw()
+	if pm := probe.Message.GetProtocolMessage(); pm.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return pm.GetKey().GetID()
+	}
+	return ""
+}
+
+// addEdited stores an edited message that isn't here at all, marked edited.
+func addEdited(x execer, r *msgRow, isGroup bool) bool {
+	if upsertMessage(x, r) != nil {
+		return false
+	}
+	x.Exec(`UPDATE messages SET edited=1 WHERE chat=? AND id=?`, r.Chat, r.ID)
+	bumpChat(x, r.Chat, isGroup, r.TS, r.ID)
+	return true
 }
 
 func isEditProto(m *waE2E.Message) bool {
