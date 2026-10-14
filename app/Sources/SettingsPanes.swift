@@ -411,7 +411,7 @@ import UserNotifications
             Form.group(rows.map { Form.value($0.0, $0.1, selectable: false) })
         }
         return [
-            keys([("New message", "⌘N"), ("Search chats", "⌘F"), ("Settings", "⌘,"), ("Message field", "⌘L")]),
+            keys([("New message", "⌘N"), ("Search chats", "⌘F"), ("Quick search", "⌘K"), ("Settings", "⌘,"), ("Message field", "⌘L")]),
             keys([("Next chat", "⌃⇥"), ("Previous chat", "⌃⇧⇥"), ("Go to chat 1–9", "⌘1 – ⌘9"), ("Chats", "⌘0"),
                   ("Archived chats", "⇧⌘A")]),
             keys([("Mark as read or unread", "⇧⌘U"), ("Pin or unpin", "⇧⌘P"), ("Mute or unmute", "⇧⌘M"), ("Archive or unarchive", "⌘E")]),

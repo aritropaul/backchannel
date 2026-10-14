@@ -376,9 +376,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 if let s = env["WA_SETTINGS_SECTION"].flatMap(SettingsSection.init) { self?.settings?.show(s) }
             }
         }
-        if env["WA_DEMO_OPEN"] != nil || env["WA_MENTION_DEMO"] != nil || env["WA_SHEET_DEMO"] != nil {
+        if env["WA_DEMO_OPEN"] != nil || env["WA_MENTION_DEMO"] != nil || env["WA_SHEET_DEMO"] != nil || env["WA_QUICK_SEARCH"] != nil {
             // Dev demos run in my own chat only: select it first, whatever chat was open last.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.wc?.list.select(jid: Core.shared.me) }
+        }
+        if let qs = env["WA_QUICK_SEARCH"] {
+            // Dev: the ⌘K palette over my own chat with the sidebar folded, typing each
+            // "|"-separated query in turn (4.5 s apiece, the first 2 s after the fold), then
+            // everything put back as it was.
+            let last = UserDefaults.standard.string(forKey: "WA.lastChat")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                guard let wc = self?.wc, wc.convo.chat?.jid == Core.shared.me else { return }
+                let folded = !wc.list.compact
+                if folded { wc.toggleCompactSidebar(nil) }
+                let queries = qs.components(separatedBy: "|")
+                for (i, q) in queries.enumerated() {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2 + 4.5 * Double(i)) {
+                        if wc.quickSearch == nil { wc.toggleQuickSearch() }
+                        wc.quickSearch?.setQuery(q)
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2 + 4.5 * Double(queries.count)) {
+                    wc.quickSearch?.dismiss()
+                    if folded { wc.toggleCompactSidebar(nil) }
+                    if let last { UserDefaults.standard.set(last, forKey: "WA.lastChat") }
+                }
+            }
         }
         if let id = env["WA_DEMO_OPEN"] {
             // Dev: opens a message's attachment as a click does (downloading it first if needed),
@@ -559,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc func nextChat(_ sender: Any?) { wc?.list.selectRelative(1) }
     @objc func previousChat(_ sender: Any?) { wc?.list.selectRelative(-1) }
     @objc func searchChats(_ sender: Any?) { wc?.list.focusSearch() }
+    @objc func quickSearch(_ sender: Any?) { wc?.toggleQuickSearch() }
     @objc func showArchived(_ sender: Any?) { wc?.list.showArchive(true) }
     @objc func showChats(_ sender: Any?) { wc?.list.showArchive(false) }
     @objc func goToChat(_ sender: NSMenuItem) { wc?.list.selectNth(sender.tag) }
@@ -645,6 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             item("Select All", #selector(NSText.selectAll(_:)), "a"),
             .separator(),
             item("Search Chats", #selector(searchChats(_:)), "f", target: self),
+            item("Quick Search", #selector(quickSearch(_:)), "k", target: self),
             item("Emoji & Symbols", #selector(NSApplication.orderFrontCharacterPalette(_:)), " ", [.command, .control]),
         ])
         var goItems: [NSMenuItem] = []

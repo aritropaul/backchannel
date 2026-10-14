@@ -272,7 +272,7 @@ final class ContactSheet: NSView {
 }
 
 /// The dimmed chat behind the sheet; a click on it puts the sheet away.
-private final class SheetScrim: NSView {
+final class SheetScrim: NSView {
     var onClick: (() -> Void)?
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {

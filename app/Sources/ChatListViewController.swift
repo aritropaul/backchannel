@@ -11,12 +11,22 @@ protocol ChatListDelegate: AnyObject {
 /// hairline from the text column to the trailing edge.
 final class SidebarRowView: NSTableRowView {
     var showsSeparator = false
+    /// Draws the selection in the accent tone even while the table isn't focused (the ⌘K
+    /// palette's field keeps the keyboard).
+    var alwaysEmphasized = false
+    /// How far in from the row's sides the selection is drawn.
+    var selectionInset: CGFloat = 10
 
     override var allowsVibrancy: Bool { false }
 
+    override var isEmphasized: Bool {
+        get { alwaysEmphasized || super.isEmphasized }
+        set { super.isEmphasized = newValue }
+    }
+
     override func drawSelection(in dirtyRect: NSRect) {
         (isEmphasized ? Theme.selection : NSColor.unemphasizedSelectedContentBackgroundColor).setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 10, dy: 0), xRadius: 10, yRadius: 10).fill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: selectionInset, dy: 0), xRadius: 10, yRadius: 10).fill()
     }
 
     override func drawBackground(in dirtyRect: NSRect) {

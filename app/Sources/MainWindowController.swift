@@ -296,6 +296,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
     // MARK: selection
 
     func chatList(didSelect chat: Chat?) {
+        quickSearch?.dismiss(restoringFocus: false)   // a chat picked in the sidebar instead
         guard chat?.jid != convo.chat?.jid || convo.isComposing else { return }
         convo.open(chat)
         if !Core.shared.isPreview { UserDefaults.standard.set(chat?.jid, forKey: "WA.lastChat") }
@@ -399,6 +400,34 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, ChatList
                 self?.profile.debugPush(String(page))
             }
         }
+    }
+
+    // MARK: quick search
+
+    /// The ⌘K palette while it's up.
+    private(set) var quickSearch: QuickSearch?
+
+    /// ⌘K: with the sidebar folded to its compact column, which has no search field, the
+    /// search palette (or away again); with the full sidebar, its own field.
+    func toggleQuickSearch() {
+        guard isShowingMain else { return }
+        if let q = quickSearch { return q.dismiss() }
+        guard list.compact else { return list.focusSearch() }
+        let q = QuickSearch(store: store)
+        q.onChat = { [weak self] c in self?.openFromSearch(c, message: nil) }
+        q.onMessage = { [weak self] h, c in self?.openFromSearch(c, message: h.id) }
+        q.onDismissed = { [weak self, weak q] in
+            if self?.quickSearch === q { self?.quickSearch = nil }
+        }
+        quickSearch = q
+        q.present(in: convo.view)
+    }
+
+    /// A palette pick: the chat (scrolled to the message, for a message result), ready to type in.
+    private func openFromSearch(_ c: Chat, message id: String?) {
+        list.select(jid: c.jid)
+        if let id { chatList(didSelectMessage: id, in: c) }
+        convo.composer.focus()
     }
 
     // MARK: sidebar
