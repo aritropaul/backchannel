@@ -376,7 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 if let s = env["WA_SETTINGS_SECTION"].flatMap(SettingsSection.init) { self?.settings?.show(s) }
             }
         }
-        if env["WA_DEMO_OPEN"] != nil || env["WA_MENTION_DEMO"] != nil || env["WA_SHEET_DEMO"] != nil || env["WA_QUICK_SEARCH"] != nil {
+        if env["WA_DEMO_OPEN"] != nil || env["WA_MENTION_DEMO"] != nil || env["WA_SHEET_DEMO"] != nil || env["WA_QUICK_SEARCH"] != nil
+            || env["WA_REACTORS"] != nil {
             // Dev demos run in my own chat only: select it first, whatever chat was open last.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.wc?.list.select(jid: Core.shared.me) }
         }
@@ -399,6 +400,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2 + 4.5 * Double(queries.count)) {
                     wc.quickSearch?.dismiss()
                     if folded { wc.toggleCompactSidebar(nil) }
+                    if let last { UserDefaults.standard.set(last, forKey: "WA.lastChat") }
+                }
+            }
+        }
+        if let spec = env["WA_REACTORS"] {
+            // Dev: the who-reacted list on a message in my own chat (`<id>` or `<id>:sample`),
+            // shown for 8 s; the last chat is put back.
+            let p = spec.split(separator: ":").map(String.init)
+            let last = UserDefaults.standard.string(forKey: "WA.lastChat")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let wc = self?.wc, wc.convo.chat?.jid == Core.shared.me else { return }
+                wc.convo.jump(to: p[0])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { wc.convo.debugReactors(id: p[0], sample: p.count > 1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 9.5) {
+                    wc.convo.reactors?.close()
                     if let last { UserDefaults.standard.set(last, forKey: "WA.lastChat") }
                 }
             }

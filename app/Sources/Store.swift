@@ -288,6 +288,24 @@ final class Store {
         return m.map { withVotes([$0], chat: chat)[0] }
     }
 
+    /// Who reacted to a message and with what: me first, then everyone else, latest first.
+    /// History stores the other person's reactions in a one-to-one chat without a sender.
+    func reactors(chat: String, id: String) -> [(jid: String, emoji: String)] {
+        var rows: [(jid: String, emoji: String)] = []
+        query("SELECT sender, emoji FROM reactions WHERE chat = ? AND msg_id = ? AND emoji != '' ORDER BY ts DESC", [chat, id]) {
+            rows.append((jid: $0.str(0), emoji: $0.str(1)))
+        }
+        var seen = Set<String>()
+        var out: [(jid: String, emoji: String)] = []
+        for r in rows {
+            let jid = r.jid.isEmpty && !JID.isGroup(chat) ? chat : r.jid
+            guard !jid.isEmpty, seen.insert(jid).inserted else { continue }
+            out.append((jid: jid, emoji: r.emoji))
+        }
+        if let i = out.firstIndex(where: { $0.jid == Core.shared.me }), i > 0 { out.insert(out.remove(at: i), at: 0) }
+        return out
+    }
+
     /// Newest message of a kind in a chat (dev hooks).
     func latestID(chat: String, kind: MessageKind) -> String? {
         var id: String?

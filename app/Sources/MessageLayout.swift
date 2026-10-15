@@ -3,7 +3,7 @@ import AppKit
 /// Geometry + drawing for one message row, Messages-style. Built once per
 /// (message, width, flags); the table asks it for `height` and to `draw`.
 final class MessageLayout {
-    enum Hit { case link(URL), media, quote, readMore, file, retry, voice, card(RichCard.Hit), none }
+    enum Hit { case link(URL), media, quote, readMore, file, retry, voice, card(RichCard.Hit), reactions, none }
 
     struct Flags: Equatable {
         var firstInRun = true
@@ -762,6 +762,7 @@ final class MessageLayout {
     // MARK: hit testing (row coordinates)
 
     func hit(_ p: CGPoint) -> Hit {
+        if let r = reactionRect, r.contains(p) { return .reactions }
         if let f = failedRect, f.insetBy(dx: -4, dy: -4).contains(p) { return .retry }
         if let rc = rich, let h = rc.hit(CGPoint(x: p.x - richOrigin.x, y: p.y - richOrigin.y)) { return .card(h) }
         if let t = text {

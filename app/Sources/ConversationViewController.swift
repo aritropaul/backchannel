@@ -174,6 +174,8 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     let mentionPicker = MentionPicker()
     /// The card a tapped mention opens.
     var contactSheet: ContactSheet?
+    /// Who reacted to a message, while its list is open.
+    weak var reactors: NSPopover?
     /// The open group's members, for mentions; loaded when "@" is first typed.
     var mentionPeople: [MentionCandidate]?
     let jumpButton = NSButton()
@@ -282,7 +284,11 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
         scrollView.postsFrameChangedNotifications = true
         NotificationCenter.default.addObserver(forName: NSScrollView.willStartLiveScrollNotification, object: scrollView,
                                                queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.isScrolling = true }
+            MainActor.assumeIsolated {
+                self?.isScrolling = true
+                // The list would stay put while its badge scrolls away.
+                self?.reactors?.close()
+            }
         }
         NotificationCenter.default.addObserver(forName: NSScrollView.didEndLiveScrollNotification, object: scrollView,
                                                queue: .main) { [weak self] _ in
@@ -342,6 +348,7 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
         mentionPeople = nil
         contactSheet?.removeFromSuperview()
         contactSheet = nil
+        reactors?.close()
         MentionDirectory.shared.set(c?.isGroup == true ? store.mentionNames(c!.jid) : [])
         guard let c else {
             msgs = []

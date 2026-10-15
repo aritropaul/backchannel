@@ -130,6 +130,7 @@ extension ConversationViewController: NSTableViewDataSource, NSTableViewDelegate
             guard case .message(let l) = r, case .message(let old)? = oldByKey[r.key], old !== l else { continue }
             if abs(old.height - l.height) > 0.1 { heightChanged.insert(i) }
             if let v = tableView.view(atColumn: 0, row: i, makeIfNecessary: false) as? BubbleView { v.item = l }
+            if old.msg.reactions != l.msg.reactions { refreshReactors(l) }
         }
         tableView.noteHeightOfRows(withIndexesChanged: heightChanged)
         tableView.layoutSubtreeIfNeeded()

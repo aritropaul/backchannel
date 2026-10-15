@@ -99,6 +99,20 @@ extension ConversationViewController {
         return tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? BubbleView
     }
 
+    /// Dev (`WA_REACTORS=<id>[:sample]`): the list a click on this message's badge opens.
+    /// "sample" fills it with made-up people and no photos (nothing is looked up), so a
+    /// chat with one reaction can show the list scrolling and a long name truncating.
+    func debugReactors(id: String, sample: Bool) {
+        guard let cell = cell(for: id), let m = cell.item?.msg else { return }
+        guard sample else { return showReactors(m, from: cell) }
+        let names = ["Alex", "Sam Ortiz", "Jordan Rivera-Castellanos de la Fuente", "Priya", "Noor", "Theo Lindqvist",
+                     "Mika", "Dana", "Rui"]
+        let emoji = ["😂", "❤️", "😂", "🙏", "❤️", "👍", "😮", "❤️", "😂"]
+        let people = [ReactorsViewController.Person(jid: Core.shared.me, name: "You", emoji: "❤️", photo: Avatars.shared.path(for: Core.shared.me) ?? "-")]
+            + zip(names, emoji).enumerated().map { i, p in .init(jid: "sample\(i)", name: p.0, emoji: p.1, photo: "-") }
+        showReactors(m, from: cell, people: people)
+    }
+
     /// A reaction flying in from where the menu's strip would be (below and right of the
     /// message, as a right-click opens it).
     func debugFlight(id: String, emoji: String) {

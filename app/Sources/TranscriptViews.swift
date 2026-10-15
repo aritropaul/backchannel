@@ -91,10 +91,14 @@ final class ReactionBadgeView: NSView {
 
     private let frost = FrostView()
     private let ink = Ink()
+    /// VoiceOver's press: who reacted (a click reaches the bubble instead).
+    var onPress: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
         // Dark glass in light mode too, like Messages' tapbacks over a photo.
         frost.appearance = NSAppearance(named: .darkAqua)
         frost.lockMaterial(.hudWindow)
@@ -106,6 +110,7 @@ final class ReactionBadgeView: NSView {
     override var isFlipped: Bool { true }
 
     func configure(_ r: Reactions) {
+        setAccessibilityLabel("Reactions: \(r.emoji), \(r.total)")
         let size = Self.size(for: r)
         ink.items = Array(zip(Self.items(r), Self.slots(for: r))).map { (text: $0.0.text, font: $0.0.font, slot: $0.1) }
         ink.frame = bounds
@@ -116,6 +121,11 @@ final class ReactionBadgeView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         ink.frame = bounds
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onPress?()
+        return onPress != nil
     }
 
     /// A circle, or a capsule with the circle's round ends.
@@ -277,6 +287,10 @@ final class BubbleView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         badge.isHidden = true
+        badge.onPress = { [weak self] in
+            guard let self, let m = self.item?.msg else { return }
+            self.controller?.showReactors(m, from: self)
+        }
         frost.isHidden = true
         cardFrost.isHidden = true
         // Reused rows change height without a layout pass: the content must follow the
@@ -447,6 +461,10 @@ final class BubbleView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard let item else { return super.mouseDown(with: event) }
         let p = convert(event.locationInWindow, from: nil)
+        if case .reactions = item.hit(p) {
+            controller?.showReactors(item.msg, from: self)
+            return
+        }
         if event.clickCount == 2, item.contains(p) {
             controller?.reply(to: item.msg)
             return
@@ -464,7 +482,7 @@ final class BubbleView: NSView {
         case .retry: controller?.retry(item.msg)
         case .voice: controller?.toggleVoice(item.msg)
         case .card(let h): controller?.cardAction(item.msg, h, from: self)
-        case .none: super.mouseDown(with: event)
+        case .reactions, .none: super.mouseDown(with: event)
         }
     }
 
