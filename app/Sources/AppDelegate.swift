@@ -306,6 +306,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // Dev: scrolls the open chat to a message.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak main] in main?.convo.jump(to: id) }
         }
+        if let spec = env["WA_SITES"], let colon = spec.lastIndex(of: ":") {
+            // Dev: fetch each link in <file> as its site card, drawn to <out>-light/-dark.png.
+            DevCards.sites(urls: String(spec[..<colon]), out: String(spec[spec.index(after: colon)...]))
+        }
+        if let file = env["WA_SEND_SELF"], let list = try? String(contentsOfFile: file, encoding: .utf8) {
+            // Dev: once connected, sends each line of <file> to my own chat, two seconds apart.
+            let lines = list.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            func send(_ i: Int, tries: Int) {
+                let core = Core.shared
+                guard core.state == "connected", let num = core.me.split(separator: "@").first?.split(separator: ":").first else {
+                    if tries < 90 { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { send(i, tries: tries + 1) } }
+                    return
+                }
+                guard i < lines.count else { return }
+                let res = core.call("send_text", ["chat": "\(num)@s.whatsapp.net", "text": lines[i], "quote": ""])
+                NSLog("WA_SEND_SELF %d/%d %@", i + 1, lines.count, (res["error"] as? String) ?? "sent")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { send(i + 1, tries: 0) }
+            }
+            send(0, tries: 0)
+        }
         if let out = env["WA_CARDS"] {
             // Dev: sample poll, event and contact bubbles drawn to <out>-light/-dark.png.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { DevCards.render(to: out) }

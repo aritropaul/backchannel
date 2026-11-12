@@ -10,13 +10,13 @@ final class TextBlock {
     /// Width of the last line, for tucking the timestamp in beside it.
     let lastLineWidth: CGFloat
 
-    init(_ text: NSAttributedString, maxWidth: CGFloat, maxLines: Int = 0) {
+    init(_ text: NSAttributedString, maxWidth: CGFloat, maxLines: Int = 0, truncation: NSLineBreakMode = .byTruncatingTail) {
         storage = NSTextStorage(attributedString: text)
         container = NSTextContainer(size: CGSize(width: max(1, maxWidth), height: .greatestFiniteMagnitude))
         container.lineFragmentPadding = 0
         if maxLines > 0 {
             container.maximumNumberOfLines = maxLines
-            container.lineBreakMode = .byTruncatingTail
+            container.lineBreakMode = truncation
         }
         layoutManager.usesFontLeading = true
         layoutManager.addTextContainer(container)

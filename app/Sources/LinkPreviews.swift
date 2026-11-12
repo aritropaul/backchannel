@@ -26,15 +26,30 @@ enum LinkPreviews {
     }
 }
 
+/// What a link on screen is waiting for.
+enum LinkJob {
+    /// Its site's own card; `fallback` asks for a plain preview if the site has none.
+    case site(fallback: Bool)
+    case preview
+}
+
 extension ConversationViewController {
-    /// A link that came without a preview (sent before the preview was ready, or from a device
-    /// that doesn't make them) gets one here, kept on this Mac only. Only as its message loads
-    /// on screen, two at a time: older messages are never swept through in advance.
+    /// A link to a site we know (X, YouTube, GitHub…) gets that site's card; a link that came
+    /// without a preview (sent before the preview was ready, or from a device that doesn't
+    /// make them) gets one here. Both are kept on this Mac only, and made only as the message
+    /// loads on screen, two at a time: older messages are never swept through in advance.
     func previewLinkIfNeeded(_ m: Message) {
-        guard m.kind == .text, m.linkTitle.isEmpty, m.linkURL.isEmpty, !linkRequested.contains(m.id),
-              let jid = chat?.jid, let url = WAText.firstURL(m.text), url.scheme?.hasPrefix("http") == true else { return }
-        linkRequested.insert(m.id)
-        linkQueue.append((jid, m.id, url))
+        guard m.kind == .text, !linkRequested.contains(m.id), let jid = chat?.jid, let url = m.cardLink else { return }
+        let bare = m.linkTitle.isEmpty && m.linkURL.isEmpty
+        if m.storedSite == nil || !m.siteFilesPresent, Sites.handles(url) {
+            linkRequested.insert(m.id)
+            linkQueue.append((jid, m.id, url, .site(fallback: bare)))
+        } else if bare, m.siteCard == nil {
+            linkRequested.insert(m.id)
+            linkQueue.append((jid, m.id, url, .preview))
+        } else {
+            return
+        }
         pumpLinks()
     }
 
@@ -42,23 +57,51 @@ extension ConversationViewController {
         while linksInFlight < 2, !linkQueue.isEmpty {
             let next = linkQueue.removeFirst()
             linksInFlight += 1
-            LinkPreviews.fetch(next.url) { outcome in
+            let finish: @Sendable () -> Void = {
                 DispatchQueue.main.async { [weak self] in
-                    switch outcome {
-                    case .found(let title, let thumb):
-                        Core.shared.call("set_link_preview", ["chat": next.chat, "id": next.id, "link_url": next.url.absoluteString,
-                                                              "link_title": title, "thumb": thumb ?? ""])
-                    case .none:
-                        Core.shared.call("set_link_preview", ["chat": next.chat, "id": next.id, "link_url": next.url.absoluteString,
-                                                              "link_title": ""])
-                    case .failed:
-                        break
-                    }
                     guard let self else { return }
                     self.linksInFlight -= 1
                     self.pumpLinks()
                 }
             }
+            switch next.job {
+            case .site(let fallback):
+                Sites.fetch(next.url) { outcome in
+                    DispatchQueue.main.async { [weak self] in
+                        switch outcome {
+                        case .card(let card):
+                            Self.storeSite(card, chat: next.chat, id: next.id)
+                        case .none:
+                            Self.storeSite(.nothing(next.url.absoluteString), chat: next.chat, id: next.id)
+                            if fallback { self?.linkQueue.append((next.chat, next.id, next.url, .preview)) }
+                        case .failed:
+                            if fallback { self?.linkQueue.append((next.chat, next.id, next.url, .preview)) }
+                        }
+                        finish()
+                    }
+                }
+            case .preview:
+                LinkPreviews.fetch(next.url) { outcome in
+                    DispatchQueue.main.async {
+                        switch outcome {
+                        case .found(let title, let thumb):
+                            Core.shared.call("set_link_preview", ["chat": next.chat, "id": next.id, "link_url": next.url.absoluteString,
+                                                                  "link_title": title, "thumb": thumb ?? ""])
+                        case .none:
+                            Core.shared.call("set_link_preview", ["chat": next.chat, "id": next.id, "link_url": next.url.absoluteString,
+                                                                  "link_title": ""])
+                        case .failed:
+                            break
+                        }
+                        finish()
+                    }
+                }
+            }
         }
+    }
+
+    private static func storeSite(_ card: SiteCard, chat: String, id: String) {
+        guard let data = try? JSONEncoder().encode(card), let json = String(data: data, encoding: .utf8) else { return }
+        Core.shared.call("set_site", ["chat": chat, "id": id, "text": json])
     }
 }

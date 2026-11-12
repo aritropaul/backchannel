@@ -133,6 +133,16 @@ enum WAText {
         return d.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length))?.url
     }
 
+    /// The text without the link a site card stands for, and the spaces before it.
+    static func removingLink(_ url: URL, from text: String) -> String {
+        guard let d = detector else { return text }
+        let ns = text as NSString
+        let matches = d.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        guard var r = (matches.first { $0.url == url } ?? matches.first)?.range else { return text }
+        while r.location > 0, ns.character(at: r.location - 1) == 0x20 { r.location -= 1; r.length += 1 }
+        return ns.replacingCharacters(in: r, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func attributed(_ text: String, color: NSColor, linkColor: NSColor, font: NSFont = Theme.body) -> NSAttributedString {
         let para = NSMutableParagraphStyle()
         para.lineBreakMode = .byWordWrapping

@@ -108,6 +108,8 @@ func call(raw []byte) (out any) {
 		err = a.setLinkPreview(r.Chat, r.ID, r.LinkURL, r.LinkTitle, r.LinkDesc, r.Thumb)
 	case "set_transcript":
 		err = a.setTranscript(r.Chat, r.ID, r.Text, r.Label, r.Times)
+	case "set_site":
+		err = a.setSite(r.Chat, r.ID, r.Text)
 	case "video_prefix":
 		res, err = a.videoPrefix(r.Chat, r.ID, r.Bytes)
 	case "set_thumb":
@@ -396,6 +398,31 @@ func (a *App) setTranscript(chat, id, text, lang string, times [][]float64) erro
 	} else {
 		delete(obj, "transcript_times")
 	}
+	b, _ := json.Marshal(obj)
+	if _, err := a.db.Exec(`UPDATE messages SET extra=? WHERE chat=? AND id=?`, string(b), chat, id); err != nil {
+		return err
+	}
+	a.touchMsg(chat, id)
+	return nil
+}
+
+// setSite keeps a link's site card (post text, author, counts, image files; made in Swift
+// from the site's own data) in the row's extra JSON. It stays on this Mac. A card marked
+// "none" records that the site had nothing to show, so it isn't asked again.
+func (a *App) setSite(chat, id, card string) error {
+	var v map[string]any
+	if json.Unmarshal([]byte(card), &v) != nil {
+		return errors.New("the site card isn't a JSON object")
+	}
+	var extra string
+	if err := a.rdb.QueryRow(`SELECT extra FROM messages WHERE chat=? AND id=?`, chat, id).Scan(&extra); err != nil {
+		return err
+	}
+	obj := map[string]any{}
+	if extra != "" && json.Unmarshal([]byte(extra), &obj) != nil {
+		return errors.New("this message's extra isn't JSON")
+	}
+	obj["site"] = v
 	b, _ := json.Marshal(obj)
 	if _, err := a.db.Exec(`UPDATE messages SET extra=? WHERE chat=? AND id=?`, string(b), chat, id); err != nil {
 		return err

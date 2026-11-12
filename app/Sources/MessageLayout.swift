@@ -31,6 +31,8 @@ final class MessageLayout {
     /// A message that's one emoji and nothing else, drawn large without a bubble.
     private(set) var bigEmojiRect: CGRect?
     private var tail = false
+    /// A site card followed by its text bubble leaves the tail to the text.
+    private var cardTail = true
     private var sender: TextBlock?
     private var senderOrigin = CGPoint.zero
     private var quoteRect: CGRect?
@@ -56,6 +58,8 @@ final class MessageLayout {
     private var transcriptOrigin = CGPoint.zero
     private var transcriptRect: CGRect?
     private(set) var cardRect: CGRect?
+    /// A link drawn the way its site shows it, on a link card's grey (in `cardRect`).
+    private var site: SiteCardLayout?
     private var cardBanner: CGRect?
     private var cardSquare: CGRect?
     private var cardTitle: TextBlock?
@@ -159,6 +163,20 @@ final class MessageLayout {
         } else if msg.kind == .voice || msg.kind == .audio {
             y = buildVoice(top: y, maxBubble: maxBubble)
             if let b = bubble { reactionAnchor(b) }
+        } else if let card = msg.siteCard {
+            let s = SiteCardLayout(card: card, maxWidth: maxBubble)
+            site = s
+            let c = CGRect(x: fromMe ? width - Self.edge - s.size.width : lead, y: y, width: s.size.width, height: s.size.height)
+            cardRect = c
+            y += s.size.height
+            reactionAnchor(c)
+            // The card stands for the link, so the text keeps only the words around it.
+            let words = msg.cardLink.map { WAText.removingLink($0, from: msg.text) } ?? msg.text
+            if !words.isEmpty || !msg.quoteID.isEmpty {
+                // The card first, the text underneath; only the text carries the tail.
+                cardTail = false
+                y = buildBubble(top: y + 2, maxBubble: maxBubble, bodyOverride: words)
+            }
         } else if msg.hasLinkPreview {
             let bare = isBareLink && msg.quoteID.isEmpty
             if !bare {
@@ -681,8 +699,13 @@ final class MessageLayout {
         return top + (y - top) + footerH
     }
 
-    private func drawCard(_ r: CGRect) {
-        let path = Self.bubblePath(r, fromMe: msg.fromMe, tail: flags.lastInRun)
+    private func drawCard(_ r: CGRect, highlight: Bool, onImageLoad: @escaping () -> Void) {
+        let path = Self.bubblePath(r, fromMe: msg.fromMe, tail: flags.lastInRun && cardTail)
+        if let site {
+            // The site's own message: a bubble of this shape, in the site's colours.
+            site.draw(in: r, path: path, highlight: highlight && bubble == nil, onImageLoad: onImageLoad)
+            return
+        }
         if !msg.fromMe && Theme.frostsOverWallpaper {
             Theme.glassTint.setFill()
             path.fill()
@@ -788,7 +811,8 @@ final class MessageLayout {
         guard !msg.fromMe else { return [] }
         var out: [NSBezierPath] = []
         if let b = bubble { out.append(Self.bubblePath(b, fromMe: false, tail: tail)) }
-        if let c = cardRect { out.append(Self.bubblePath(c, fromMe: false, tail: flags.lastInRun)) }
+        // A site's message paints its own colour; no glass under it.
+        if let c = cardRect, site == nil { out.append(Self.bubblePath(c, fromMe: false, tail: flags.lastInRun)) }
         return out
     }
 
@@ -851,7 +875,7 @@ final class MessageLayout {
             if bubble == nil, msg.kind == .notice { Theme.drawChip(behind: CGRect(origin: textOrigin, size: t.size)) }
             t.draw(at: textOrigin)
         }
-        if let c = cardRect { drawCard(c) }
+        if let c = cardRect { drawCard(c, highlight: highlight, onImageLoad: onImageLoad) }
         if let a = avatarRect { drawAvatar(a, onImageLoad: onImageLoad) }
         if let f = footer {
             f.draw(at: footerOrigin)   // plain text, coloured for the wallpaper behind it

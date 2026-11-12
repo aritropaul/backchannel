@@ -141,9 +141,9 @@ final class ConversationViewController: NSViewController, QLPreviewPanelDataSour
     var inlineVideo: InlineVideo?
     var waveformTried: Set<String> = []
     var thumbRequested: Set<String> = []
-    /// Links I sent without a preview, asked for (once a session) and waiting their turn.
+    /// Links waiting for a site card or a preview (asked for once a session), in turn.
     var linkRequested: Set<String> = []
-    var linkQueue: [(chat: String, id: String, url: URL)] = []
+    var linkQueue: [(chat: String, id: String, url: URL, job: LinkJob)] = []
     var linksInFlight = 0
     var posterQueue: [(chat: String, id: String)] = []
     var postersInFlight = 0

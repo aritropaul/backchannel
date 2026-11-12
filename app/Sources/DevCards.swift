@@ -128,4 +128,72 @@ enum DevCards {
             }
         }
     }
+
+    /// Dev only (WA_SITES): each link fetched as its site card (written to <out>.txt) and
+    /// drawn as a bare link, alternately mine and theirs, then once more with text around it.
+    static func sites(urls file: String, out: String) {
+        guard let list = try? String(contentsOfFile: file, encoding: .utf8) else { return }
+        let urls = list.split(separator: "\n").compactMap { URL(string: String($0).trimmingCharacters(in: .whitespaces)) }
+        Task { @MainActor in
+            var log = ""
+            var samples: [Message] = []
+            for (i, url) in urls.enumerated() {
+                let outcome = await Task.detached { await Sites.card(for: url) }.value
+                var card: SiteCard?
+                switch outcome {
+                case .card(let c):
+                    card = c
+                    let json = (try? JSONEncoder().encode(c)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                    log += "\(url.absoluteString)\n  card \(json)\n"
+                case .none: log += "\(url.absoluteString)\n  none\n"
+                case .failed: log += "\(url.absoluteString)\n  failed\n"
+                }
+                guard let card, let data = try? JSONEncoder().encode(["site": card]) else { continue }
+                samples.append(message("s\(i)", kind: .text, fromMe: i % 2 == 0, text: url.absoluteString,
+                                       extra: String(data: data, encoding: .utf8) ?? ""))
+                if i == 0 {
+                    samples.append(message("t\(i)", kind: .text, fromMe: false, text: "this is the one I meant \(url.absoluteString)",
+                                           extra: String(data: data, encoding: .utf8) ?? ""))
+                }
+            }
+            try? log.write(toFile: out + ".txt", atomically: true, encoding: .utf8)
+            draw(samples, to: out)
+            // Pictures load off the main thread; the second pass has them.
+            try? await Task.sleep(for: .seconds(2))
+            draw(samples, to: out)
+        }
+    }
+
+    private static func draw(_ samples: [Message], to out: String) {
+        let width: CGFloat = 640
+        for dark in [false, true] {
+            guard let ap = NSAppearance(named: dark ? .darkAqua : .aqua) else { continue }
+            var layouts: [MessageLayout] = []
+            ap.performAsCurrentDrawingAppearance {
+                layouts = samples.map { MessageLayout(msg: $0, width: width, flags: .init()) }
+            }
+            let total = layouts.reduce(0) { $0 + $1.height + 8 }
+            let img = NSImage(size: NSSize(width: width, height: max(total, 1)), flipped: true) { r in
+                ap.performAsCurrentDrawingAppearance {
+                    Theme.canvas.setFill()
+                    r.fill()
+                    var y: CGFloat = 0
+                    for l in layouts {
+                        NSGraphicsContext.saveGraphicsState()
+                        let t = NSAffineTransform()
+                        t.translateX(by: 0, yBy: y)
+                        t.concat()
+                        l.draw(highlight: false) {}
+                        NSGraphicsContext.restoreGraphicsState()
+                        y += l.height + 8
+                    }
+                }
+                return true
+            }
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: out + (dark ? "-dark.png" : "-light.png")))
+            }
+        }
+    }
 }
